@@ -225,6 +225,18 @@ sends an SNS notification. If the change looks like a problem (e.g. the
 provider's records suddenly resolve to almost nothing), spf53 refuses and
 alerts instead of publishing.
 
+## Releasing
+
+Releases publish to PyPI automatically via GitHub Actions
+[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC —
+no stored API tokens). To cut a release:
+
+1. Bump `version` in `pyproject.toml` and commit.
+2. Tag it (`git tag vX.Y.Z && git push origin vX.Y.Z`) and publish a
+   [GitHub Release](https://github.com/babyhuey/spf53/releases) from that tag.
+3. The `Release` workflow builds the sdist/wheel and publishes to PyPI —
+   watch the [Actions tab](https://github.com/babyhuey/spf53/actions) for status.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
