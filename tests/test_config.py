@@ -209,6 +209,61 @@ domains:
     assert cfg.domains[0].max_shrink_pct == value
 
 
+def test_domain_name_lowercased() -> None:
+    yaml_text = """
+domains:
+  - name: Example.COM
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].name == "example.com"
+
+
+def test_domain_name_trailing_dot_stripped() -> None:
+    yaml_text = """
+domains:
+  - name: example.com.
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].name == "example.com"
+
+
+def test_domain_name_lowercased_and_trailing_dot_stripped() -> None:
+    yaml_text = """
+domains:
+  - name: Example.COM.
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].name == "example.com"
+
+
+def test_domain_name_only_strips_a_single_trailing_dot() -> None:
+    yaml_text = """
+domains:
+  - name: example.com..
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].name == "example.com."
+
+
+def test_domain_name_all_dots_raises_config_error() -> None:
+    yaml_text = """
+domains:
+  - name: "."
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    with pytest.raises(ConfigError, match="name"):
+        parse_config(yaml_text)
+
+
 def test_load_config_file(tmp_path: Path) -> None:
     config_path = tmp_path / "spf53.yaml"
     config_path.write_text(MINIMAL_YAML)

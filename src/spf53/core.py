@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ipaddress
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from botocore.exceptions import ClientError
 
 from spf53 import chunker, guards, notify, resolver, route53
 from spf53.config import Spf53Config
@@ -28,6 +30,7 @@ class DomainPlan:
     lookup_cost: int
     apex_warning: str | None
     summary: str
+    delete_ttls: dict[str, int] = field(default_factory=dict)
 
     @property
     def has_changes(self) -> bool:
@@ -52,14 +55,19 @@ def plan(cfg: Spf53Config) -> RunResult:
             continue
 
         desired = chunker.build_records(dc.name, networks, dc.passthrough, dc.policy)
-        live_all = route53.get_txt_records(dc.hosted_zone_id, dc.name)
+        live_all, live_ttls = route53.get_txt_records(dc.hosted_zone_id, dc.name)
         live = {name: strings for name, strings in live_all.items() if name != dc.name}
         apex_warning = _apex_warning(dc.name, live_all.get(dc.name))
 
         upserts = {name: strings for name, strings in desired.items() if live.get(name) != strings}
         deletes = {name: strings for name, strings in live.items() if name not in desired}
+        delete_ttls = {name: live_ttls[name] for name in deletes if name in live_ttls}
 
-        live_networks = _networks_from_records(live)
+        try:
+            live_networks = _networks_from_records(live)
+        except ValueError as exc:
+            errors.append(f"{dc.name}: {exc}")
+            continue
         guard = guards.check_guards(live_networks, networks, dc.max_shrink_pct)
 
         plans.append(
@@ -74,6 +82,7 @@ def plan(cfg: Spf53Config) -> RunResult:
                 lookup_cost=chunker.lookup_cost(desired, dc.passthrough),
                 apex_warning=apex_warning,
                 summary=_build_summary(dc.name, live_networks, networks),
+                delete_ttls=delete_ttls,
             )
         )
 
@@ -82,6 +91,7 @@ def plan(cfg: Spf53Config) -> RunResult:
 
 def apply(cfg: Spf53Config, force: bool = False) -> RunResult:
     result = plan(cfg)
+    errors = list(result.errors)
 
     for p in result.plans:
         if not p.has_changes:
@@ -89,19 +99,28 @@ def apply(cfg: Spf53Config, force: bool = False) -> RunResult:
         if not p.guard.ok and not force:
             _notify_refusal(cfg.sns_topic_arn, p)
             continue
-        route53.apply_changes(p.zone_id, p.upserts, p.deletes)
+        try:
+            route53.apply_changes(p.zone_id, p.upserts, p.deletes, delete_ttls=p.delete_ttls)
+        except ClientError as exc:
+            msg = f"{p.domain}: failed to apply Route53 changes: {exc}"
+            errors.append(msg)
+            notify.publish(cfg.sns_topic_arn, f"spf53: failed to apply changes for {p.domain}", msg)
+            continue
         _notify_success(cfg.sns_topic_arn, p)
 
     for err in result.errors:
         notify.publish(cfg.sns_topic_arn, "spf53: SPF resolution failed", err)
 
-    return result
+    return RunResult(plans=result.plans, errors=tuple(errors))
 
 
 def _apex_warning(domain: str, apex_record: list[str] | None) -> str | None:
-    if not apex_record:
-        return None
     expected = f"include:_spf53-1.{domain}"
+    if apex_record is None:
+        return (
+            f"no apex TXT record found for {domain} — create one: "
+            f"v=spf1 include:_spf53-1.{domain} ~all"
+        )
     if expected in "".join(apex_record):
         return None
     return (
@@ -112,11 +131,16 @@ def _apex_warning(domain: str, apex_record: list[str] | None) -> str | None:
 
 def _networks_from_records(records: dict[str, list[str]]) -> list[IPNetwork]:
     networks: list[IPNetwork] = []
-    for strings in records.values():
+    for name, strings in records.items():
         for token in "".join(strings).split():
             for prefix in ("ip4:", "ip6:"):
                 if token.startswith(prefix):
-                    networks.append(ipaddress.ip_network(token[len(prefix) :], strict=False))
+                    try:
+                        networks.append(ipaddress.ip_network(token[len(prefix) :], strict=False))
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"invalid {prefix} token {token!r} in live record {name!r}: {exc}"
+                        ) from exc
                     break
     return networks
 

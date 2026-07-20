@@ -30,7 +30,7 @@ spf53 is the middle ground: a small tool you run yourself, on a schedule,
 that re-flattens automatically, refuses to publish a change that looks
 dangerous, and tells you when something needs attention.
 
-Every run (every 6 hours by default): resolve providers → flatten to IPs →
+Every run (every hour by default): resolve providers → flatten to IPs →
 diff against what's live in Route53 → guard-check the diff → apply as one
 atomic change → notify over SNS. No diff, no writes, no noise.
 
@@ -102,7 +102,7 @@ function, EventBridge schedule — all created or updated idempotently):
 spf53 deploy -c spf53.yaml --create-topic spf53-alerts
 ```
 
-From then on, spf53 runs itself every 6 hours. To trigger a one-off run
+From then on, spf53 runs itself every hour. To trigger a one-off run
 against the config already deployed to SSM:
 
 ```bash
@@ -163,7 +163,7 @@ the RFC 7208 limit.
 |---|---|---|
 | `spf53 plan` | `[-c FILE \| --ssm-param NAME]` | Prints the per-domain diff, lookup cost, and expected apex record. Exit `0` if nothing would change, `2` if changes are pending, `1` on error. |
 | `spf53 apply` | `[-c FILE \| --ssm-param NAME] [--force]` | Applies the flattened records. Exit `0` on success (including no-op), `1` on error or guard refusal. |
-| `spf53 deploy` | `-c FILE [--schedule "rate(6 hours)"] [--create-topic NAME] [--param-name NAME] [--function-name spf53] [--region REGION] [--dry-run]` | Idempotently bootstraps the SNS topic, SSM config, IAM role, Lambda function, and EventBridge schedule. `--dry-run` prints the planned actions without making any AWS calls. |
+| `spf53 deploy` | `-c FILE [--schedule "rate(1 hour)"] [--create-topic NAME] [--param-name NAME] [--function-name spf53] [--region REGION] [--dry-run]` | Idempotently bootstraps the SNS topic, SSM config, IAM role, Lambda function, and EventBridge schedule. `--dry-run` prints the planned actions without making any AWS calls. |
 
 If neither `-c/--config` nor `--ssm-param` is given, `plan` and `apply`
 read from SSM parameter `/spf53/config`.
@@ -205,7 +205,10 @@ verbatim.
 **Why isn't boto3 bundled in the Lambda deployment package?**
 The Lambda Python runtime already ships boto3, so bundling it again would
 just bloat the deployment zip for no benefit. `spf53 deploy` only packages
-`dnspython`, `pyyaml`, and the spf53 package itself.
+`dnspython`, `pyyaml`, and the spf53 package itself, pinned to the pure-Python
+wheel versions installed in the environment you're deploying from — so the
+zip matches what you tested, regardless of the Lambda runtime's own Python
+version.
 
 **How do I add or remove a provider?**
 Edit the `includes` (or `passthrough`) list in your config and re-apply —

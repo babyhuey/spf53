@@ -23,8 +23,10 @@ MAX_DEPTH = 10
 _TIMEOUT_SECONDS = 5.0
 _TRIES = 2
 
-_A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len>\d+))?$", re.IGNORECASE)
-_MX_TERM_RE = re.compile(r"^mx(:(?P<host>[^/]+))?(/(?P<len>\d+))?$", re.IGNORECASE)
+_A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE)
+_MX_TERM_RE = re.compile(
+    r"^mx(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE
+)
 _QUALIFIERS = "+-~?"
 
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -100,7 +102,12 @@ def _process_record(
         if lower == "all":
             continue
         if lower.startswith("ip4:") or lower.startswith("ip6:"):
-            networks.append(ipaddress.ip_network(term[4:], strict=False))
+            try:
+                networks.append(ipaddress.ip_network(term[4:], strict=False))
+            except ValueError as exc:
+                raise ResolutionError(
+                    f"invalid CIDR literal {term!r} in {name!r} SPF record: {exc}"
+                ) from exc
             continue
         if lower.startswith("include:"):
             _walk(term[8:], resolver_ips, seen, depth + 1, networks)
@@ -118,18 +125,20 @@ def _process_record(
         a_match = _A_TERM_RE.match(term)
         if a_match:
             host = a_match.group("host") or name
-            length = _parse_len(a_match.group("len"))
+            v4_len = _parse_len(a_match.group("len4"))
+            v6_len = _parse_len(a_match.group("len6"))
             addresses = _resolve_addresses(host, resolver_ips, name)
-            networks.extend(_addresses_to_networks(addresses, length))
+            networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
             continue
 
         mx_match = _MX_TERM_RE.match(term)
         if mx_match:
             host = mx_match.group("host") or name
-            length = _parse_len(mx_match.group("len"))
+            v4_len = _parse_len(mx_match.group("len4"))
+            v6_len = _parse_len(mx_match.group("len6"))
             for exchange in _call_seam(_query_mx, host, resolver_ips, name):
                 addresses = _resolve_addresses(exchange, resolver_ips, name)
-                networks.extend(_addresses_to_networks(addresses, length))
+                networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
             continue
 
         if "=" in term:
@@ -151,12 +160,31 @@ def _resolve_addresses(host: str, resolver_ips: Sequence[str], context: str) -> 
     return a_addrs + aaaa_addrs
 
 
-def _addresses_to_networks(addresses: Sequence[str], prefixlen: int | None) -> list[_Network]:
+def _addresses_to_networks(
+    addresses: Sequence[str],
+    v4_len: int | None,
+    v6_len: int | None,
+    term: str,
+    name: str,
+) -> list[_Network]:
+    """Build networks from resolved addresses, applying each family's own prefix length.
+
+    Per RFC 7208 5.3, a single `/len` is the ip4-cidr-length only; ip6 addresses use
+    `v6_len` (from the `//len` dual-cidr form) and otherwise default to /128.
+    """
     networks: list[_Network] = []
     for addr in addresses:
-        ip = ipaddress.ip_address(addr)
-        length = prefixlen if prefixlen is not None else ip.max_prefixlen
-        networks.append(ipaddress.ip_network(f"{ip}/{length}", strict=False))
+        try:
+            ip = ipaddress.ip_address(addr)
+            is_v4 = isinstance(ip, ipaddress.IPv4Address)
+            length = v4_len if is_v4 else v6_len
+            if length is None:
+                length = ip.max_prefixlen
+            networks.append(ipaddress.ip_network(f"{ip}/{length}", strict=False))
+        except ValueError as exc:
+            raise ResolutionError(
+                f"invalid address/prefix from {term!r} in {name!r} SPF record: {exc}"
+            ) from exc
     return networks
 
 

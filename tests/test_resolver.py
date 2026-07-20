@@ -169,6 +169,84 @@ def test_mx_mechanism_with_host_and_prefix_len(fake_dns: FakeDNS) -> None:
     assert result == [net("198.51.100.0/24")]
 
 
+def test_a_single_slash_prefix_len_applies_only_to_ipv4(fake_dns: FakeDNS) -> None:
+    """F1 repro: a `/LEN` single-slash form is the ip4-cidr-length only (RFC 7208 5.3)
+
+    and must not be applied to AAAA results, which should default to /128.
+    """
+    fake_dns.txt["provider.example.com"] = ["v=spf1 a:mail.provider.com/24 ~all"]
+    fake_dns.a["mail.provider.com"] = ["192.0.2.10"]
+    fake_dns.aaaa["mail.provider.com"] = ["2001:db8:1234::1"]
+
+    result = flatten(["provider.example.com"], RESOLVER_IPS)
+
+    assert result == [net("192.0.2.0/24"), net("2001:db8:1234::1/128")]
+
+
+def test_a_dual_cidr_with_host_applies_len_per_family(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 a:mail.provider.com/24//64 ~all"]
+    fake_dns.a["mail.provider.com"] = ["192.0.2.10"]
+    fake_dns.aaaa["mail.provider.com"] = ["2001:db8:1234::1"]
+
+    result = flatten(["provider.example.com"], RESOLVER_IPS)
+
+    assert result == [net("192.0.2.0/24"), net("2001:db8:1234::/64")]
+
+
+def test_a_bare_ip6_only_dual_cidr(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 a//64 ~all"]
+    fake_dns.a["own.example.com"] = ["198.51.100.7"]
+    fake_dns.aaaa["own.example.com"] = ["2001:db8::7"]
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("198.51.100.7/32"), net("2001:db8::/64")]
+
+
+def test_a_host_ip6_only_dual_cidr(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 a:other.example.com//64 ~all"]
+    fake_dns.a["other.example.com"] = ["203.0.113.16"]
+    fake_dns.aaaa["other.example.com"] = ["2001:db8:cafe::16"]
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("203.0.113.16/32"), net("2001:db8:cafe::/64")]
+
+
+def test_mx_bare_dual_cidr_applies_len_per_family(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 mx/16//48 ~all"]
+    fake_dns.mx["own.example.com"] = ["mail.example.com"]
+    fake_dns.a["mail.example.com"] = ["198.51.100.30"]
+    fake_dns.aaaa["mail.example.com"] = ["2001:db8:abcd::30"]
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("198.51.0.0/16"), net("2001:db8:abcd::/48")]
+
+
+def test_invalid_ip4_literal_raises_resolution_error(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 ip4:999.1.2.3/24 ~all"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["provider.example.com"], RESOLVER_IPS)
+
+    message = str(exc_info.value)
+    assert "provider.example.com" in message
+    assert "999.1.2.3/24" in message
+
+
+def test_out_of_range_prefix_len_raises_resolution_error(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 a:other.example.com/33 ~all"]
+    fake_dns.a["other.example.com"] = ["203.0.113.16"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+    message = str(exc_info.value)
+    assert "own.example.com" in message
+    assert "a:other.example.com/33" in message
+
+
 def test_redirect_modifier_is_followed_like_an_include(fake_dns: FakeDNS) -> None:
     fake_dns.txt["own.example.com"] = ["v=spf1 redirect=provider.example.com"]
     fake_dns.txt["provider.example.com"] = ["v=spf1 ip4:203.0.113.50/32 ~all"]

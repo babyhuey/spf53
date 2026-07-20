@@ -10,6 +10,7 @@ and run. Once the real modules land, this stub is skipped entirely.
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import types
 from dataclasses import dataclass
@@ -103,6 +104,8 @@ def _install_config_ssm_stubs() -> None:
 _install_config_ssm_stubs()
 
 from spf53 import deploy  # noqa: E402
+
+_REAL_BUILD_LAMBDA_ZIP = deploy.build_lambda_zip
 
 SAMPLE_CONFIG = """\
 domains:
@@ -242,3 +245,85 @@ def test_missing_config_file_returns_error(tmp_path: Path) -> None:
     args = _make_args(tmp_path / "does-not-exist.yaml")
 
     assert deploy.run_deploy(args) == 1
+
+
+@mock_aws
+def test_update_path_waits_between_code_and_config_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from botocore.client import BaseClient
+
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts")
+
+    # First run creates the function; only the second run hits the update path.
+    assert deploy.run_deploy(args) == 0
+
+    calls: list[str] = []
+
+    original_wait = deploy._wait_for_update
+
+    def recording_wait(lam: object, function_name: str) -> None:
+        calls.append("wait")
+        original_wait(lam, function_name)
+
+    monkeypatch.setattr(deploy, "_wait_for_update", recording_wait)
+
+    original_make_api_call = BaseClient._make_api_call
+
+    def recording_make_api_call(
+        self: BaseClient, operation_name: str, api_params: object
+    ) -> object:
+        if operation_name in ("UpdateFunctionCode", "UpdateFunctionConfiguration"):
+            calls.append(operation_name)
+        return original_make_api_call(self, operation_name, api_params)
+
+    monkeypatch.setattr(BaseClient, "_make_api_call", recording_make_api_call)
+
+    assert deploy.run_deploy(args) == 0
+
+    assert calls == ["UpdateFunctionCode", "wait", "UpdateFunctionConfiguration"]
+
+
+@mock_aws
+def test_wait_for_update_swallows_waiter_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from botocore.exceptions import WaiterError
+
+    lam = boto3.client("lambda", region_name="us-east-1")
+
+    class ExplodingWaiter:
+        def wait(self, **kwargs: object) -> None:
+            raise WaiterError(name="function_updated_v2", reason="boom", last_response={})
+
+    monkeypatch.setattr(lam, "get_waiter", lambda name: ExplodingWaiter())
+
+    deploy._wait_for_update(lam, "some-function")  # must not raise
+
+
+@mock_aws
+def test_pip_failure_during_zip_build_returns_clean_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts")
+
+    def failing_pip_install(*cmd: object, **kwargs: object) -> None:
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["pip", "install"],
+            output="",
+            stderr="ERROR: Could not find a version satisfying dnspython==9.9.9\n",
+        )
+
+    # stub_zip_build (autouse) replaces build_lambda_zip wholesale; put the
+    # real implementation back so its internal subprocess.run call is exercised.
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+    monkeypatch.setattr(deploy.subprocess, "run", failing_pip_install)
+
+    result = deploy.run_deploy(args)
+
+    assert result == 1
+    err = capsys.readouterr().err
+    assert "spf53 deploy: failed to build Lambda package:" in err
+    assert "dnspython==9.9.9" in err
+    assert "Traceback" not in err

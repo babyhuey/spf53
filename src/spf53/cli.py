@@ -33,7 +33,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     deploy_parser = subparsers.add_parser("deploy", help="deploy the spf53 Lambda")
     deploy_parser.add_argument("-c", "--config", required=True, metavar="FILE")
-    deploy_parser.add_argument("--schedule", default="rate(6 hours)")
+    deploy_parser.add_argument("--schedule", default="rate(1 hour)")
     deploy_parser.add_argument("--create-topic", metavar="NAME")
     deploy_parser.add_argument("--param-name", default=ssm.DEFAULT_PARAM)
     deploy_parser.add_argument("--function-name", default="spf53")

@@ -8,8 +8,10 @@ Lambda deployment package + function, EventBridge schedule.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import io
 import json
+import logging
 import shutil
 import subprocess
 import sys
@@ -22,10 +24,12 @@ from typing import Any
 import boto3
 import yaml
 from botocore.client import BaseClient
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, WaiterError
 
 from spf53.config import ConfigError, Spf53Config, parse_config
 from spf53.ssm import put_config_ssm
+
+logger = logging.getLogger(__name__)
 
 ROLE_NAME = "spf53-lambda"
 POLICY_NAME = "spf53-lambda-policy"
@@ -77,6 +81,11 @@ def run_deploy(args: argparse.Namespace) -> int:
         _ensure_schedule(session, args.schedule, args.function_name, function_arn)
     except (ClientError, BotoCoreError) as exc:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        stderr_lines = (exc.stderr or "").strip().splitlines()
+        detail = stderr_lines[-1] if stderr_lines else str(exc)
+        print(f"spf53 deploy: failed to build Lambda package: {detail}", file=sys.stderr)
         return 1
 
     return 0
@@ -202,14 +211,23 @@ def build_lambda_zip() -> bytes:
     """Build the Lambda deployment package.
 
     Bundles dnspython, pyyaml, and the spf53 package itself. boto3 is
-    provided by the Lambda runtime and is intentionally excluded.
+    provided by the Lambda runtime and is intentionally excluded. Both deps
+    are pinned to the versions installed in the current environment (rather
+    than left to float to whatever's newest on PyPI) so the zip matches what
+    was actually tested; both are pure-Python wheels, so this stays a plain
+    pip install with no cross-platform build flags needed.
     """
     pkg_dir = Path(__file__).resolve().parent
+    pinned_deps = [
+        f"dnspython=={importlib.metadata.version('dnspython')}",
+        f"pyyaml=={importlib.metadata.version('pyyaml')}",
+    ]
     with tempfile.TemporaryDirectory() as build_dir:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--target", build_dir, "dnspython", "pyyaml"],
+            [sys.executable, "-m", "pip", "install", "--target", build_dir, *pinned_deps],
             check=True,
             capture_output=True,
+            text=True,
         )
         shutil.copytree(
             pkg_dir, Path(build_dir) / "spf53", ignore=shutil.ignore_patterns("__pycache__")
@@ -247,6 +265,22 @@ def _create_function(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def _wait_for_update(lam: BaseClient, function_name: str) -> None:
+    """Wait out an in-progress Lambda update before the next mutating call.
+
+    On real AWS, create_function/update_function_code leave the function
+    with LastUpdateStatus=InProgress for a few seconds; a mutating call made
+    during that window raises ResourceConflictException. moto applies
+    updates synchronously, so this waiter no-ops under test. If the waiter
+    itself misbehaves (missing, or never observes a terminal status), that's
+    logged and swallowed rather than failing the deploy.
+    """
+    try:
+        lam.get_waiter("function_updated_v2").wait(FunctionName=function_name)
+    except (WaiterError, ValueError, ClientError, BotoCoreError) as exc:
+        logger.info("waiter for %s did not confirm update completion: %s", function_name, exc)
+
+
 def _ensure_lambda_function(
     session: boto3.Session, function_name: str, role_arn: str, param_name: str
 ) -> str:
@@ -263,6 +297,7 @@ def _ensure_lambda_function(
 
     if exists:
         lam.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
+        _wait_for_update(lam, function_name)
         response = lam.update_function_configuration(
             FunctionName=function_name,
             Runtime=RUNTIME,
@@ -275,6 +310,7 @@ def _ensure_lambda_function(
         print(f"updated Lambda function {function_name}")
     else:
         response = _create_function(lam, function_name, role_arn, zip_bytes, env)
+        _wait_for_update(lam, function_name)
         print(f"created Lambda function {function_name}")
 
     return response["FunctionArn"]

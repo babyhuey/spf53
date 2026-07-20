@@ -95,6 +95,14 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
     name = raw["name"]
     if not isinstance(name, str) or not name:
         raise ConfigError(f"{label}: 'name' must be a non-empty string")
+    # Normalize so config names match what Route53 returns (always lowercase,
+    # unqualified) — otherwise every diff looks like a change and the shrink
+    # guard never sees a matching live record.
+    name = name.lower()
+    if name.endswith("."):
+        name = name[:-1]
+    if not name:
+        raise ConfigError(f"{label}: 'name' must be a non-empty string")
     label = f"domain '{name}'"
 
     if "hosted_zone_id" not in raw:

@@ -80,7 +80,7 @@ def test_get_txt_records_apex_and_chunks(zone_id: str) -> None:
         },
     )
 
-    result = route53.get_txt_records(zone_id, DOMAIN)
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
 
     assert result == {
         DOMAIN: ["v=spf1 include:_spf53-1.example.com ~all"],
@@ -92,7 +92,7 @@ def test_get_txt_records_apex_and_chunks(zone_id: str) -> None:
 def test_get_txt_records_keys_have_no_trailing_dot(zone_id: str) -> None:
     _put_txt(zone_id, DOMAIN, ["v=spf1 ~all"])
 
-    result = route53.get_txt_records(zone_id, DOMAIN)
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
 
     assert all(not key.endswith(".") for key in result)
 
@@ -106,7 +106,7 @@ def test_get_txt_records_ignores_non_matching_names(zone_id: str) -> None:
     # unrelated name
     _put_txt(zone_id, f"notspf53.{DOMAIN}", ["decoy"])
 
-    result = route53.get_txt_records(zone_id, DOMAIN)
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
 
     assert set(result) == {DOMAIN}
 
@@ -115,7 +115,7 @@ def test_get_txt_records_decodes_escaped_values(zone_id: str) -> None:
     tricky = ['has "quotes" inside', "and a \\ backslash"]
     _put_txt(zone_id, f"_spf53-1.{DOMAIN}", tricky)
 
-    result = route53.get_txt_records(zone_id, DOMAIN)
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
 
     assert result[f"_spf53-1.{DOMAIN}"] == tricky
 
@@ -123,7 +123,7 @@ def test_get_txt_records_decodes_escaped_values(zone_id: str) -> None:
 def test_get_txt_records_trailing_dot_domain_input(zone_id: str) -> None:
     _put_txt(zone_id, DOMAIN, ["v=spf1 ~all"])
 
-    result = route53.get_txt_records(zone_id, f"{DOMAIN}.")
+    result, _ttls = route53.get_txt_records(zone_id, f"{DOMAIN}.")
 
     assert DOMAIN in result
 
@@ -182,7 +182,7 @@ def test_get_txt_records_paginates_across_pages(zone_id: str) -> None:
     client = boto3.client("route53", region_name="us-east-1")
     client.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch={"Changes": changes})
 
-    result = route53.get_txt_records(zone_id, DOMAIN)
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
 
     assert result[DOMAIN] == ["v=spf1 include:_spf53-1.example.com ~all"]
     for name, strings in expected_chunks.items():
@@ -203,7 +203,7 @@ def test_apply_changes_upsert_and_delete_in_one_batch(zone_id: str) -> None:
         deletes={f"_spf53-3.{DOMAIN}": ["stale chunk 3"]},
     )
 
-    result = route53.get_txt_records(zone_id, DOMAIN)
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
     assert result[f"_spf53-1.{DOMAIN}"] == ["v=spf1 ip4:1.2.3.0/24 include:_spf53-2.example.com"]
     assert result[f"_spf53-2.{DOMAIN}"] == ["v=spf1 ip4:5.6.7.0/24 ~all"]
     assert f"_spf53-3.{DOMAIN}" not in result
@@ -249,3 +249,52 @@ def test_apply_changes_empty_dicts_is_noop(zone_id: str) -> None:
     with mock.patch("boto3.client") as mock_client:
         route53.apply_changes(zone_id, {}, {})
     mock_client.assert_not_called()
+
+
+def test_get_txt_records_captures_live_ttl(zone_id: str) -> None:
+    _put_txt(zone_id, f"_spf53-1.{DOMAIN}", ["v=spf1 ~all"], ttl=600)
+
+    _records, ttls = route53.get_txt_records(zone_id, DOMAIN)
+
+    assert ttls[f"_spf53-1.{DOMAIN}"] == 600
+
+
+def test_apply_changes_delete_uses_live_ttl(zone_id: str) -> None:
+    """A hand-edited record's TTL may not be the default 300; Route53 requires
+
+    DELETE to match the live TTL exactly, so the whole batch must fail if the
+    wrong TTL is sent. Capturing and reusing the live TTL must let it succeed.
+    """
+    _put_txt(zone_id, f"_spf53-1.{DOMAIN}", ["stale chunk"], ttl=600)
+
+    live, ttls = route53.get_txt_records(zone_id, DOMAIN)
+    assert ttls[f"_spf53-1.{DOMAIN}"] == 600
+
+    route53.apply_changes(
+        zone_id,
+        upserts={},
+        deletes={f"_spf53-1.{DOMAIN}": live[f"_spf53-1.{DOMAIN}"]},
+        delete_ttls=ttls,
+    )
+
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
+    assert f"_spf53-1.{DOMAIN}" not in result
+
+
+def test_apply_changes_delete_with_wrong_ttl_fails_whole_batch(zone_id: str) -> None:
+    """Without the live TTL, the DELETE (and thus the atomic batch) is rejected."""
+    from botocore.exceptions import ClientError
+
+    _put_txt(zone_id, f"_spf53-1.{DOMAIN}", ["stale chunk"], ttl=600)
+
+    with pytest.raises(ClientError):
+        route53.apply_changes(
+            zone_id,
+            upserts={f"_spf53-2.{DOMAIN}": ["v=spf1 ~all"]},
+            deletes={f"_spf53-1.{DOMAIN}": ["stale chunk"]},
+            # no delete_ttls passed, so the default ttl=300 is used instead of the live 600
+        )
+
+    # the atomic batch was rejected, so the bundled upsert never landed either
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
+    assert f"_spf53-2.{DOMAIN}" not in result
