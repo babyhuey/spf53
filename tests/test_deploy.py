@@ -141,7 +141,7 @@ def _write_config(tmp_path: Path, text: str = SAMPLE_CONFIG) -> Path:
 def _make_args(config_path: Path, **overrides: object) -> argparse.Namespace:
     defaults: dict[str, object] = {
         "config": str(config_path),
-        "schedule": "rate(6 hours)",
+        "schedule": "rate(1 hour)",
         "create_topic": None,
         "param_name": "/spf53/config",
         "function_name": "spf53",
