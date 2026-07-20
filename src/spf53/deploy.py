@@ -214,7 +214,8 @@ def build_lambda_zip() -> bytes:
     provided by the Lambda runtime and is intentionally excluded. Both deps
     are pinned to the versions installed in the current environment (rather
     than left to float to whatever's newest on PyPI) so the zip matches what
-    was actually tested; both are pure-Python wheels, so this stays a plain
+    was actually tested; both work without compiled extensions (pyyaml falls
+    back to its pure-Python implementation), so this stays a plain
     pip install with no cross-platform build flags needed.
     """
     pkg_dir = Path(__file__).resolve().parent

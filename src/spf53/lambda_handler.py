@@ -19,6 +19,6 @@ def lambda_handler(event: dict, context: object) -> dict:
     response = {"changed": changed, "refused": refused, "errors": errors}
 
     if errors:
-        raise RuntimeError(f"spf53: {len(errors)} domain(s) failed to resolve: {'; '.join(errors)}")
+        raise RuntimeError(f"spf53: {len(errors)} domain(s) had errors: {'; '.join(errors)}")
 
     return response
