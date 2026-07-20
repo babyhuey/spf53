@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spf53"
+version = "0.1.0"
+description = "Self-hosted SPF flattener for Route53 — reapply your SPF automatically"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Hannah Lyons" }]
+keywords = ["spf", "dmarc", "dns", "route53", "email", "flattening"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+    "Topic :: Internet :: Name Service (DNS)",
+]
+dependencies = [
+    "boto3>=1.34",
+    "dnspython>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "moto[route53,sns,ssm,iam,awslambda,events]>=5.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+spf53 = "spf53.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/babyhuey/spf53"
+Issues = "https://github.com/babyhuey/spf53/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spf53"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
