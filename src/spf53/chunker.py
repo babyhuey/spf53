@@ -12,12 +12,13 @@ reproduces the original "mech1 mech2 ..." content byte-for-byte.
 from collections.abc import Sequence
 from ipaddress import IPv4Network, IPv6Network
 
+from spf53 import _spf
+
 MAX_TXT_STRING = 255
 MAX_STRINGS_PER_RECORD = 2
 DNS_QUERYING_MECHANISMS = frozenset({"include", "exists", "a", "mx", "ptr"})
 
 _MAX_RECORD_CHARS = MAX_TXT_STRING * MAX_STRINGS_PER_RECORD
-_QUALIFIERS = "+-~?"
 
 
 def build_records(
@@ -101,7 +102,7 @@ def from_route53_value(value: str) -> list[str]:
 
 def _is_dns_querying_mechanism(term: str) -> bool:
     """Whether `term` is an a/mx/ptr/include/exists mechanism (exact keyword, not a prefix)."""
-    body = term[1:] if term and term[0] in _QUALIFIERS else term
+    body = _spf.strip_qualifier(term)
     cut = len(body)
     for sep in (":", "/"):
         idx = body.find(sep)

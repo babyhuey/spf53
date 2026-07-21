@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from spf53 import chunker, guards, notify, resolver, route53
+from spf53 import _spf, chunker, guards, notify, resolver, route53
 from spf53.config import DomainConfig, Spf53Config
 from spf53.guards import GuardResult
 from spf53.resolver import ResolutionError
@@ -17,9 +17,12 @@ from spf53.resolver import ResolutionError
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 _SUMMARY_LIST_CAP = 20
-# Each domain's resolver.flatten() already runs its own internal
-# ThreadPoolExecutor(max_workers=8) for DNS concurrency, so this pool must
-# stay small to avoid multiplying thread counts across domains.
+# Each domain worker here also runs its own 2-worker pair pool (flatten +
+# get_txt_records, see _plan_one_domain), and one of that pair (flatten)
+# runs its own internal ThreadPoolExecutor(max_workers=8) for DNS
+# concurrency. Worst case per domain is therefore 1 (this pool) + 2 (pair
+# pool) + 8 (flatten's internal pool) = 11 threads, so this must stay small
+# enough that _MAX_DOMAIN_WORKERS * 11 stays a reasonable total thread count.
 _MAX_DOMAIN_WORKERS = 4
 
 
@@ -78,20 +81,28 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
     per-domain failure — never raises for the failure modes each try/except
     below handles, so one domain's failure can't affect any other domain.
     """
-    try:
-        networks = resolver.flatten(dc.includes, resolver_ips)
-    except ResolutionError as exc:
-        return str(exc)
+    # resolver.flatten (DNS) and route53.get_txt_records (AWS API) are
+    # independent of each other's result, so run them concurrently rather
+    # than paying their latency sequentially.
+    with ThreadPoolExecutor(max_workers=2) as pair_pool:
+        flatten_future = pair_pool.submit(resolver.flatten, dc.includes, resolver_ips)
+        txt_future = pair_pool.submit(route53.get_txt_records, dc.hosted_zone_id, dc.name)
+
+        try:
+            networks = flatten_future.result()
+        except ResolutionError as exc:
+            return str(exc)
+
+        try:
+            live_all, live_ttls = txt_future.result()
+        except (ClientError, BotoCoreError) as exc:
+            return f"{dc.name}: {exc}"
 
     try:
         desired = chunker.build_records(dc.name, networks, dc.passthrough, dc.policy)
     except ValueError as exc:
         return f"{dc.name}: {exc}"
 
-    try:
-        live_all, live_ttls = route53.get_txt_records(dc.hosted_zone_id, dc.name)
-    except (ClientError, BotoCoreError) as exc:
-        return f"{dc.name}: {exc}"
     live = {name: strings for name, strings in live_all.items() if name != dc.name}
     apex_warning = _apex_warning(dc.name, live_all.get(dc.name))
 
@@ -103,7 +114,13 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
         live_networks = _networks_from_records(live)
     except ValueError as exc:
         return f"{dc.name}: {exc}"
-    guard = guards.check_guards(live_networks, networks, dc.max_shrink_pct)
+
+    try:
+        comparison_networks = networks + _passthrough_networks(dc.passthrough)
+    except ValueError as exc:
+        return f"{dc.name}: {exc}"
+
+    guard = guards.check_guards(live_networks, comparison_networks, dc.max_shrink_pct)
 
     return DomainPlan(
         domain=dc.name,
@@ -115,7 +132,7 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
         guard=guard,
         lookup_cost=chunker.lookup_cost(desired, dc.passthrough),
         apex_warning=apex_warning,
-        summary=_build_summary(dc.name, live_networks, networks),
+        summary=_build_summary(dc.name, live_networks, comparison_networks),
         delete_ttls=delete_ttls,
     )
 
@@ -154,7 +171,7 @@ def _apex_warning(domain: str, apex_record: list[str] | None) -> str | None:
             f"no apex TXT record found for {domain} — create one: "
             f"v=spf1 include:_spf53-1.{domain} ~all"
         )
-    if expected in "".join(apex_record):
+    if expected.lower() in "".join(apex_record).lower():
         return None
     return (
         f"live apex TXT record for {domain} does not contain '{expected}' — "
@@ -162,27 +179,46 @@ def _apex_warning(domain: str, apex_record: list[str] | None) -> str | None:
     )
 
 
-_QUALIFIERS = "+-~?"
+def _parse_ip_token(raw_token: str, context: str) -> IPNetwork | None:
+    """Strip qualifier and parse a single SPF term into a network.
 
-
-def _strip_qualifier(token: str) -> str:
-    return token[1:] if token and token[0] in _QUALIFIERS else token
+    Returns None if `raw_token` isn't an ip4:/ip6: mechanism (e.g. an
+    `exists:` macro, or any other term) — those aren't networks and
+    contribute nothing to the caller's list.
+    """
+    token = _spf.strip_qualifier(raw_token)
+    for prefix in ("ip4:", "ip6:"):
+        if token.startswith(prefix):
+            try:
+                return ipaddress.ip_network(token[len(prefix) :], strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid {prefix} token {token!r} in {context}: {exc}") from exc
+    return None
 
 
 def _networks_from_records(records: dict[str, list[str]]) -> list[IPNetwork]:
     networks: list[IPNetwork] = []
     for name, strings in records.items():
         for raw_token in "".join(strings).split():
-            token = _strip_qualifier(raw_token)
-            for prefix in ("ip4:", "ip6:"):
-                if token.startswith(prefix):
-                    try:
-                        networks.append(ipaddress.ip_network(token[len(prefix) :], strict=False))
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"invalid {prefix} token {token!r} in live record {name!r}: {exc}"
-                        ) from exc
-                    break
+            network = _parse_ip_token(raw_token, f"live record {name!r}")
+            if network is not None:
+                networks.append(network)
+    return networks
+
+
+def _passthrough_networks(passthrough: Sequence[str]) -> list[IPNetwork]:
+    """Parse the ip4:/ip6: literal entries out of a domain's passthrough list.
+
+    Mirrors _networks_from_records' token parsing, but over a passthrough
+    list instead of live record strings: passthrough entries that aren't
+    ip4:/ip6: mechanisms (e.g. a Salesforce `exists:` macro) simply aren't
+    networks and contribute nothing.
+    """
+    networks: list[IPNetwork] = []
+    for raw_token in passthrough:
+        network = _parse_ip_token(raw_token, "passthrough entry")
+        if network is not None:
+            networks.append(network)
     return networks
 
 

@@ -12,6 +12,7 @@ import importlib.metadata
 import io
 import json
 import logging
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import yaml
 from botocore.client import BaseClient
 from botocore.exceptions import BotoCoreError, ClientError, WaiterError
 
+import spf53
 from spf53.config import ConfigError, Spf53Config, parse_config
 from spf53.ssm import put_config_ssm
 
@@ -253,17 +255,25 @@ def build_lambda_zip() -> bytes:
     the zip matches what was actually tested; both work without compiled
     extensions (pyyaml falls back to its pure-Python implementation), so
     this stays a plain pip install with no cross-platform build flags
-    needed. spf53 itself is also installed via pip (rather than a raw
-    directory copy) so the zip carries real .dist-info metadata, letting
-    importlib.metadata.version("spf53") resolve correctly at runtime inside
-    the deployed Lambda; --no-deps keeps it from re-resolving dnspython/
-    pyyaml a second time since those are already installed explicitly above.
+    needed. spf53 itself is bundled by copying files directly rather than
+    a `pip install <path>` of a reverse-engineered repo root: that only
+    worked for editable dev installs, where __file__ happens to resolve
+    under a checkout with a pyproject.toml three parents up; under a real
+    `pip install spf53` wheel install, __file__ resolves under
+    site-packages, which has no pyproject.toml, and pip install fails. The
+    package's .py files are located via spf53.__file__ (always correct,
+    editable or wheel), and its .dist-info directory is located via
+    importlib.metadata (always physically present in site-packages) and
+    copied alongside so importlib.metadata.version("spf53") still resolves
+    correctly at runtime inside the deployed Lambda.
     """
-    repo_root = Path(__file__).resolve().parent.parent.parent
     pinned_deps = [
         f"dnspython=={importlib.metadata.version('dnspython')}",
         f"pyyaml=={importlib.metadata.version('pyyaml')}",
     ]
+    package_dir = Path(spf53.__file__).resolve().parent
+    dist = importlib.metadata.distribution("spf53")
+
     with tempfile.TemporaryDirectory() as build_dir:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--target", build_dir, *pinned_deps],
@@ -271,21 +281,21 @@ def build_lambda_zip() -> bytes:
             capture_output=True,
             text=True,
         )
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--target",
-                build_dir,
-                "--no-deps",
-                str(repo_root),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+
+        build_dir_path = Path(build_dir)
+        dest_package_dir = build_dir_path / "spf53"
+        for src_path in package_dir.rglob("*.py"):
+            if "__pycache__" in src_path.parts:
+                continue
+            dest_path = dest_package_dir / src_path.relative_to(package_dir)
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dest_path)
+
+        for file in dist.files or []:
+            if file.parts[0].endswith(".dist-info"):
+                dest_path = build_dir_path / str(file)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dist.locate_file(file), dest_path)
 
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:

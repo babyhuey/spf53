@@ -283,6 +283,57 @@ def test_networks_from_records_strips_spf_qualifiers() -> None:
     assert len(networks) == 3
 
 
+def test_plan_steady_state_passthrough_cidr_matching_resolved_cidr_is_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a literal ip4:/ip6: passthrough entry gets rendered
+    verbatim into the live TXT records (chunker.build_records writes both
+    `networks` and `dc.passthrough` into the chunk), so live_networks (parsed
+    back from live) picks it up — but raw `networks` (resolver-only) never
+    does, since resolver.flatten() never walks dc.passthrough. Comparing
+    live_networks against raw `networks` therefore showed this CIDR as
+    "removed" on every run, even in a steady state where an include resolves
+    to that exact same CIDR and nothing has actually changed.
+    """
+    passthrough_cidr = "198.51.100.0/24"
+    dc = _domain(passthrough=(f"ip4:{passthrough_cidr}",))
+    resolved = ipaddress.ip_network(passthrough_cidr)
+
+    # The live records already reflect a prior apply of this exact steady
+    # state: build_records renders both the passthrough token and the
+    # resolved network verbatim into the same chunk.
+    live = chunker.build_records(dc.name, [resolved], dc.passthrough, dc.policy)
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [resolved])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: (dict(live), {}))
+
+    result = core.plan(_cfg([dc]))
+
+    assert result.errors == ()
+    p = result.plans[0]
+    assert p.guard.ok is True
+    assert p.has_changes is False
+    assert "0 CIDR(s) added, 0 CIDR(s) removed" in p.summary
+
+
+def test_plan_malformed_passthrough_cidr_isolated_to_its_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = _domain(name="bad.example", passthrough=("ip4:not-an-ip",))
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg([bad, good]))
+
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    assert "not-an-ip" in result.errors[0]
+    assert len(result.plans) == 1
+    assert result.plans[0].domain == "good.example"
+
+
 def test_apex_warning_absent_apex_still_a_warning_not_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -299,6 +350,26 @@ def test_apex_warning_absent_apex_still_a_warning_not_error(
     assert p.apex_warning is not None
     assert "_spf53-1.example.com" in p.apex_warning
     assert "v=spf1 include:_spf53-1.example.com ~all" in p.apex_warning
+
+
+def test_apex_warning_case_insensitive_match_produces_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SPF mechanism names are case-insensitive per RFC 7208 — a manually set
+    apex record using 'Include:' (or any other casing) instead of lowercase
+    'include:' is functionally identical and must not trigger a false
+    "apex record incorrect" warning.
+    """
+    dc = _domain()
+    apex_live = {dc.name: ["v=spf1 Include:_spf53-1.example.com ~all"]}
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: (dict(apex_live), {}))
+
+    result = core.plan(_cfg([dc]))
+
+    assert result.errors == ()
+    assert result.plans[0].apex_warning is None
 
 
 def test_apply_route53_client_error_recorded_and_next_domain_continues(
@@ -507,6 +578,35 @@ def test_plan_runs_domains_concurrently(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert result.errors == ()
     assert len(result.plans) == n
+
+
+def test_plan_one_domain_flatten_and_get_txt_records_run_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resolver.flatten() and route53.get_txt_records() are independent of
+    each other's result within a single domain's plan, so they must run
+    concurrently. If they ran sequentially, only one thread would ever reach
+    the barrier at a time and `barrier.wait()` would time out
+    (BrokenBarrierError), failing this test.
+    """
+    dc = _domain()
+    barrier = threading.Barrier(2, timeout=2)
+
+    def fake_flatten(includes: tuple[str, ...], ips: tuple[str, ...]) -> list:
+        barrier.wait()
+        return [NET_A]
+
+    def fake_get_txt_records(zone_id: str, domain: str) -> tuple[dict, dict]:
+        barrier.wait()
+        return {}, {}
+
+    monkeypatch.setattr(resolver, "flatten", fake_flatten)
+    monkeypatch.setattr(route53, "get_txt_records", fake_get_txt_records)
+
+    result = core.plan(_cfg([dc]))
+
+    assert result.errors == ()
+    assert len(result.plans) == 1
 
 
 def test_plan_empty_domains_returns_empty_result_without_pool() -> None:

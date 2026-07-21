@@ -401,11 +401,12 @@ def test_pip_failure_during_zip_build_returns_clean_error(
 def test_build_lambda_zip_installs_dist_info_for_version_resolution(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """build_lambda_zip must pip-install spf53 itself (not raw-copy the
-    source tree) so the zip carries real .dist-info metadata and
-    importlib.metadata.version("spf53") resolves inside the deployed Lambda
-    instead of falling back to __init__.py's "0.0.0-dev". Also confirms the
-    spf53/ package still lands at the path HANDLER needs to import it from."""
+    """build_lambda_zip must bundle spf53's real .dist-info metadata
+    (located via importlib.metadata, copied alongside the raw-copied source
+    tree) so importlib.metadata.version("spf53") resolves inside the
+    deployed Lambda instead of falling back to __init__.py's "0.0.0-dev".
+    Also confirms the spf53/ package still lands at the path HANDLER needs
+    to import it from."""
     import importlib.metadata
     import io
     import sys
@@ -429,3 +430,45 @@ def test_build_lambda_zip_installs_dist_info_for_version_resolution(
     finally:
         sys.path.remove(str(extract_dir))
         importlib.invalidate_caches()
+
+
+def test_build_lambda_zip_locates_package_via_spf53_dunder_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """build_lambda_zip must locate spf53's source files via
+    Path(spf53.__file__).resolve().parent -- which always points at wherever
+    the currently-running spf53 package actually lives, editable install or
+    wheel install alike -- rather than by counting parent directories up
+    from deploy.py's own __file__ to guess a repo root containing
+    pyproject.toml. That guess only happens to resolve correctly for an
+    editable dev install of this exact repo layout; under a real `pip
+    install spf53` wheel install, deploy.py's __file__ resolves under
+    site-packages, which has no pyproject.toml, so the old approach fails
+    for every real end user. Proven here by pointing spf53.__file__ at a
+    throwaway fake package directory: if build_lambda_zip is still deriving
+    the source location from spf53.__file__, the fake files show up in the
+    zip and the real repo's files (e.g. config.py, never part of the fake
+    package) do not. A regression back to the __file__-parent-chain
+    repo_root approach would ignore spf53.__file__ entirely, keep bundling
+    the real repo's files, and fail these assertions -- since CI always runs
+    against an editable install, this is the only test that would catch
+    that regression."""
+    import io
+    import zipfile
+
+    import spf53
+
+    fake_pkg_dir = tmp_path / "fake_site_packages" / "spf53"
+    fake_pkg_dir.mkdir(parents=True)
+    (fake_pkg_dir / "__init__.py").write_text("__version__ = 'fake-0.0.0'\n")
+    (fake_pkg_dir / "lambda_handler.py").write_text("FAKE_MARKER = True\n")
+
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+    monkeypatch.setattr(spf53, "__file__", str(fake_pkg_dir / "__init__.py"))
+
+    zip_bytes = deploy.build_lambda_zip()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        assert zf.read("spf53/__init__.py").decode() == "__version__ = 'fake-0.0.0'\n"
+        assert zf.read("spf53/lambda_handler.py").decode() == "FAKE_MARKER = True\n"
+        assert "spf53/config.py" not in zf.namelist()

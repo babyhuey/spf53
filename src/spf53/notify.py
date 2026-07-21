@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from spf53 import _boto
 
@@ -12,8 +11,16 @@ logger = logging.getLogger(__name__)
 MAX_SUBJECT_LEN = 100
 
 
-def _client() -> Any:
-    return _boto.get_client("sns")
+def _region_from_arn(arn: str) -> str | None:
+    """Extract the region from an ARN (arn:PARTITION:SERVICE:REGION:ACCOUNT:RESOURCE).
+
+    Returns None if `arn` doesn't parse as expected, so callers fall back to
+    the ambient default region instead of raising.
+    """
+    parts = arn.split(":")
+    if len(parts) < 4 or not parts[3]:
+        return None
+    return parts[3]
 
 
 def publish(topic_arn: str | None, subject: str, message: str) -> None:
@@ -26,7 +33,8 @@ def publish(topic_arn: str | None, subject: str, message: str) -> None:
         return
 
     try:
-        _client().publish(
+        client = _boto.get_client("sns", region=_region_from_arn(topic_arn))
+        client.publish(
             TopicArn=topic_arn,
             Subject=subject[:MAX_SUBJECT_LEN],
             Message=message,

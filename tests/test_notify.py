@@ -68,3 +68,22 @@ def test_publish_swallows_errors_on_bad_topic_arn(caplog: pytest.LogCaptureFixtu
         notify.publish(bad_arn, "subject", "message")
 
     assert "Failed to publish" in caplog.text
+
+
+def test_publish_uses_region_from_topic_arn() -> None:
+    # AWS_DEFAULT_REGION is us-east-1 (see conftest.py); eu-west-1 here proves
+    # the client is built from the ARN's region, not the ambient default.
+    topic_arn = "arn:aws:sns:eu-west-1:123456789012:my-topic"
+
+    with mock.patch("spf53._boto.get_client") as mock_get_client:
+        notify.publish(topic_arn, "subject", "message")
+
+    mock_get_client.assert_called_once_with("sns", region="eu-west-1")
+
+
+@pytest.mark.parametrize("bad_arn", ["not-a-real-arn", ""])
+def test_publish_falls_back_to_ambient_region_on_unparseable_arn(bad_arn: str) -> None:
+    with mock.patch("spf53._boto.get_client") as mock_get_client:
+        notify.publish(bad_arn, "subject", "message")
+
+    mock_get_client.assert_called_once_with("sns", region=None)

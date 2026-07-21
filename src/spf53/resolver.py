@@ -17,6 +17,8 @@ import dns.exception
 import dns.rdatatype
 import dns.resolver
 
+from spf53 import _spf
+
 logger = logging.getLogger(__name__)
 
 MAX_DEPTH = 10
@@ -32,7 +34,6 @@ _A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+)
 _MX_TERM_RE = re.compile(
     r"^mx(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE
 )
-_QUALIFIERS = "+-~?"
 
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -122,7 +123,7 @@ def _process_record(
     pool: ThreadPoolExecutor,
 ) -> None:
     for raw_term in record.split()[1:]:  # [0] is "v=spf1"
-        term = _strip_qualifier(raw_term)
+        term = _spf.strip_qualifier(raw_term)
         lower = term.lower()
 
         if lower == "all":
@@ -194,10 +195,6 @@ def _wait_fail_fast(futures: Sequence[Future]) -> None:
             for pending in not_done:
                 pending.cancel()
             raise future.exception()
-
-
-def _strip_qualifier(term: str) -> str:
-    return term[1:] if term and term[0] in _QUALIFIERS else term
 
 
 def _parse_len(len_str: str | None) -> int | None:
