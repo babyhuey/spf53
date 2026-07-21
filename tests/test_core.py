@@ -6,13 +6,9 @@ import ipaddress
 
 import pytest
 
-# spf53.core imports resolver/chunker/guards/route53/notify at module scope; skip this
-# whole module gracefully if a sibling module hasn't landed in this checkout yet.
-pytest.importorskip("spf53.core")
-
-from spf53 import chunker, core, notify, resolver, route53  # noqa: E402
-from spf53.config import DomainConfig, Spf53Config  # noqa: E402
-from spf53.resolver import ResolutionError  # noqa: E402
+from spf53 import chunker, core, notify, resolver, route53
+from spf53.config import DomainConfig, Spf53Config
+from spf53.resolver import ResolutionError
 
 NET_A = ipaddress.ip_network("192.0.2.0/24")
 

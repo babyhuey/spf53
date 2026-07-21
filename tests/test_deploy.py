@@ -1,19 +1,9 @@
-"""Tests for spf53.deploy.
-
-spf53.config and spf53.ssm are owned by a different work stream and may not
-exist yet when this suite runs. If either is missing, minimal stand-ins that
-match the contracts in docs/superpowers/specs/2026-07-20-spf53-design.md are
-installed into sys.modules so spf53.deploy (and these tests) can still import
-and run. Once the real modules land, this stub is skipped entirely.
-"""
+"""Unit tests for spf53.deploy."""
 
 from __future__ import annotations
 
 import argparse
 import subprocess
-import sys
-import types
-from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
@@ -21,89 +11,7 @@ import pytest
 import yaml
 from moto import mock_aws
 
-
-def _install_config_ssm_stubs() -> None:
-    try:
-        import spf53.config  # noqa: F401
-        import spf53.ssm  # noqa: F401
-
-        return
-    except ImportError:
-        pass
-
-    config_module = types.ModuleType("spf53.config")
-
-    @dataclass(frozen=True)
-    class DomainConfig:
-        name: str
-        hosted_zone_id: str
-        includes: tuple[str, ...]
-        passthrough: tuple[str, ...] = ()
-        policy: str = "~all"
-        max_shrink_pct: int = 30
-
-    @dataclass(frozen=True)
-    class Spf53Config:
-        domains: tuple[DomainConfig, ...]
-        sns_topic_arn: str | None = None
-        resolver_ips: tuple[str, ...] = ("1.1.1.1", "8.8.8.8")
-
-    class ConfigError(Exception):
-        pass
-
-    def parse_config(yaml_text: str) -> Spf53Config:
-        data = yaml.safe_load(yaml_text) or {}
-        try:
-            domains = tuple(
-                DomainConfig(
-                    name=d["name"],
-                    hosted_zone_id=d["hosted_zone_id"],
-                    includes=tuple(d.get("includes", ())),
-                    passthrough=tuple(d.get("passthrough", ())),
-                    policy=d.get("policy", "~all"),
-                    max_shrink_pct=d.get("max_shrink_pct", 30),
-                )
-                for d in data["domains"]
-            )
-        except KeyError as exc:
-            raise ConfigError(f"missing required field: {exc}") from exc
-        return Spf53Config(
-            domains=domains,
-            sns_topic_arn=data.get("sns_topic_arn"),
-            resolver_ips=tuple(data.get("resolver_ips", ("1.1.1.1", "8.8.8.8"))),
-        )
-
-    def load_config_file(path: str | Path) -> Spf53Config:
-        return parse_config(Path(path).read_text())
-
-    config_module.DomainConfig = DomainConfig
-    config_module.Spf53Config = Spf53Config
-    config_module.ConfigError = ConfigError
-    config_module.parse_config = parse_config
-    config_module.load_config_file = load_config_file
-    sys.modules["spf53.config"] = config_module
-
-    ssm_module = types.ModuleType("spf53.ssm")
-    ssm_module.DEFAULT_PARAM = "/spf53/config"
-
-    def put_config_ssm(yaml_text: str, param_name: str = "/spf53/config") -> None:
-        parse_config(yaml_text)  # validate before pushing, per contract
-        client = boto3.client("ssm")
-        client.put_parameter(Name=param_name, Value=yaml_text, Type="String", Overwrite=True)
-
-    def load_config_ssm(param_name: str = "/spf53/config") -> Spf53Config:
-        client = boto3.client("ssm")
-        value = client.get_parameter(Name=param_name)["Parameter"]["Value"]
-        return parse_config(value)
-
-    ssm_module.put_config_ssm = put_config_ssm
-    ssm_module.load_config_ssm = load_config_ssm
-    sys.modules["spf53.ssm"] = ssm_module
-
-
-_install_config_ssm_stubs()
-
-from spf53 import deploy  # noqa: E402
+from spf53 import deploy
 
 _REAL_BUILD_LAMBDA_ZIP = deploy.build_lambda_zip
 
@@ -220,6 +128,32 @@ def test_create_topic_injects_arn_into_pushed_config(tmp_path: Path) -> None:
     topic_arn = boto3.client("sns", region_name="us-east-1").list_topics()["Topics"][0]["TopicArn"]
 
     assert pushed_data["sns_topic_arn"] == topic_arn
+
+
+@mock_aws
+def test_create_topic_injection_does_not_reparse_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Injecting the freshly-created topic ARN into yaml_text must not trigger
+    an extra parse_config call: only the initial parse at the top of
+    run_deploy and the validating parse inside put_config_ssm should occur."""
+    from spf53 import config, ssm
+
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts")
+
+    real_parse_config = config.parse_config
+    calls: list[str] = []
+
+    def counting_parse_config(yaml_text: str) -> config.Spf53Config:
+        calls.append(yaml_text)
+        return real_parse_config(yaml_text)
+
+    monkeypatch.setattr(deploy, "parse_config", counting_parse_config)
+    monkeypatch.setattr(ssm, "parse_config", counting_parse_config)
+
+    assert deploy.run_deploy(args) == 0
+    assert len(calls) == 2
 
 
 @mock_aws

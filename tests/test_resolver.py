@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
 
 import pytest
@@ -364,3 +366,171 @@ def test_multi_string_txt_concatenation_mixed_str_and_bytes() -> None:
     joined = resolver._join_txt_strings(("v=spf1 ip4:198.51.100.1/32 ", b"~all"))
 
     assert joined == "v=spf1 ip4:198.51.100.1/32 ~all"
+
+
+# --- Concurrency regression tests ------------------------------------------
+# _resolve_addresses fans A/AAAA out to a thread pool, and the MX branch fans
+# multiple exchanges out to a thread pool. These tests prove: (1) the queries
+# genuinely run in parallel, (2) results are still correct, (3) an exception
+# from any one concurrent lookup still surfaces as ResolutionError without
+# hanging, and (4) output stays deterministic regardless of completion order.
+
+
+def test_a_and_aaaa_queries_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If A/AAAA ran sequentially, only one thread would ever reach the barrier
+    at a time and `barrier.wait()` would time out (BrokenBarrierError).
+    """
+    barrier = threading.Barrier(2, timeout=2)
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        barrier.wait()
+        return ["198.51.100.7"]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        barrier.wait()
+        return ["2001:db8::7"]
+
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    addresses = resolver._resolve_addresses("host.example.com", RESOLVER_IPS, "host.example.com")
+
+    assert sorted(addresses) == sorted(["198.51.100.7", "2001:db8::7"])
+
+
+def test_mx_exchanges_resolve_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same proof as above, but for 3 concurrent MX-exchange address lookups."""
+    barrier = threading.Barrier(3, timeout=2)
+    # Spaced-out last octets so no two networks are adjacent /32s that
+    # collapse_addresses would merge into a wider CIDR.
+    a_answers = {
+        "mail1.example.com": "198.51.100.10",
+        "mail2.example.com": "198.51.100.20",
+        "mail3.example.com": "198.51.100.30",
+    }
+
+    def query_txt(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["v=spf1 mx ~all"]
+
+    def query_mx(name: str, resolver_ips: list[str]) -> list[str]:
+        return list(a_answers)
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        barrier.wait()
+        return [a_answers[name]]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        return []
+
+    monkeypatch.setattr(resolver, "_query_txt", query_txt)
+    monkeypatch.setattr(resolver, "_query_mx", query_mx)
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    expected = sorted(net(f"{ip}/32") for ip in a_answers.values())
+    assert result == expected
+
+
+def test_exception_in_one_of_concurrent_a_aaaa_lookups_raises_resolution_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["203.0.113.16"]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        raise DNSFailure("boom")
+
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    with pytest.raises(ResolutionError, match="other.example.com"):
+        resolver._resolve_addresses("other.example.com", RESOLVER_IPS, "own.example.com")
+
+
+def test_one_of_several_concurrent_mx_exchange_lookups_raising_surfaces_resolution_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def query_txt(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["v=spf1 mx ~all"]
+
+    def query_mx(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["mail1.example.com", "mail2.example.com", "mail3.example.com"]
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        if name == "mail2.example.com":
+            raise DNSFailure("boom")
+        return ["198.51.100.1"]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        return []
+
+    monkeypatch.setattr(resolver, "_query_txt", query_txt)
+    monkeypatch.setattr(resolver, "_query_mx", query_mx)
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    with pytest.raises(ResolutionError, match="mail2.example.com"):
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+
+def test_flatten_is_deterministic_across_repeated_runs_with_concurrent_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same input flattened twice must produce byte-identical output, even
+    though the A/AAAA and MX-exchange resolution paths now run concurrently.
+
+    Staggered sleeps make worker threads finish in a different order than
+    they were submitted, on both runs, so this would catch a collector that
+    accidentally depended on completion order instead of submission order.
+    """
+    # Spaced-out last octets/groups so no two networks are adjacent and
+    # collapse_addresses doesn't merge any of them into a wider CIDR.
+    a_answers = {
+        "host-a.example.com": "203.0.113.10",
+        "mail1.example.com": "198.51.100.10",
+        "mail2.example.com": "198.51.100.20",
+        "mail3.example.com": "198.51.100.30",
+    }
+    aaaa_answers = {
+        "host-a.example.com": "2001:db8::10",
+        "mail1.example.com": "2001:db8:1::10",
+        "mail2.example.com": "2001:db8:1::20",
+        "mail3.example.com": "2001:db8:1::30",
+    }
+    sleep_seconds = {
+        "host-a.example.com": 0.006,
+        "mail1.example.com": 0.012,
+        "mail2.example.com": 0.0,
+        "mail3.example.com": 0.009,
+    }
+
+    def query_txt(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["v=spf1 a:host-a.example.com mx:host-mx.example.com ~all"]
+
+    def query_mx(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["mail3.example.com", "mail1.example.com", "mail2.example.com"]
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        time.sleep(sleep_seconds[name])
+        return [a_answers[name]]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        time.sleep(sleep_seconds[name])
+        return [aaaa_answers[name]]
+
+    monkeypatch.setattr(resolver, "_query_txt", query_txt)
+    monkeypatch.setattr(resolver, "_query_mx", query_mx)
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    first = flatten(["own.example.com"], RESOLVER_IPS)
+    second = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert first == second
+    # v4 networks sorted, then v6 networks sorted (flatten()'s documented order) —
+    # the two families aren't mutually orderable, so they can't be sorted together.
+    expected_v4 = sorted(net(f"{ip}/32") for ip in a_answers.values())
+    expected_v6 = sorted(net(f"{ip}/128") for ip in aaaa_answers.values())
+    assert first == [*expected_v4, *expected_v6]

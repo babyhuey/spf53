@@ -11,6 +11,7 @@ import ipaddress
 import logging
 import re
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import dns.exception
 import dns.rdatatype
@@ -22,6 +23,7 @@ MAX_DEPTH = 10
 
 _TIMEOUT_SECONDS = 5.0
 _TRIES = 2
+_MAX_WORKERS = 8
 
 _A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE)
 _MX_TERM_RE = re.compile(
@@ -136,9 +138,15 @@ def _process_record(
             host = mx_match.group("host") or name
             v4_len = _parse_len(mx_match.group("len4"))
             v6_len = _parse_len(mx_match.group("len6"))
-            for exchange in _call_seam(_query_mx, host, resolver_ips, name):
-                addresses = _resolve_addresses(exchange, resolver_ips, name)
-                networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
+            exchanges = _call_seam(_query_mx, host, resolver_ips, name)
+            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+                futures = [
+                    pool.submit(_resolve_addresses, exchange, resolver_ips, name)
+                    for exchange in exchanges
+                ]
+                for future in futures:
+                    addresses = future.result()
+                    networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
             continue
 
         if "=" in term:
@@ -155,8 +163,11 @@ def _parse_len(len_str: str | None) -> int | None:
 
 
 def _resolve_addresses(host: str, resolver_ips: Sequence[str], context: str) -> list[str]:
-    a_addrs = _call_seam(_query_a, host, resolver_ips, context)
-    aaaa_addrs = _call_seam(_query_aaaa, host, resolver_ips, context)
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        a_future = pool.submit(_call_seam, _query_a, host, resolver_ips, context)
+        aaaa_future = pool.submit(_call_seam, _query_aaaa, host, resolver_ips, context)
+        a_addrs = a_future.result()
+        aaaa_addrs = aaaa_future.result()
     return a_addrs + aaaa_addrs
 
 

@@ -6,13 +6,9 @@ import argparse
 
 import pytest
 
-# spf53.cli imports spf53.core, which imports resolver/chunker/guards/route53/notify at
-# module scope; skip this whole module gracefully if a sibling module isn't present yet.
-pytest.importorskip("spf53.cli")
-
-from spf53 import cli  # noqa: E402
-from spf53.core import DomainPlan, RunResult  # noqa: E402
-from spf53.guards import GuardResult  # noqa: E402
+from spf53 import cli
+from spf53.core import DomainPlan, RunResult
+from spf53.guards import GuardResult
 
 
 def _plan(
