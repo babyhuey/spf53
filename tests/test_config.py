@@ -323,6 +323,32 @@ domains:
     assert value in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ip4:1.2.3.4 all",
+        "include:a.com include:b.com",
+        "ip4:1.2.3.4 ip4:5.6.7.8",
+    ],
+)
+def test_passthrough_entry_with_whitespace_raises_config_error(value: str) -> None:
+    """A whitespace-containing passthrough entry is spliced verbatim into the
+    built record, so a multi-token entry like "ip4:1.2.3.4 all" would embed
+    a bare `all` mid-record without matching the single-token bare-'all'
+    check above, silently terminating SPF evaluation early.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert "whitespace" in str(exc_info.value)
+
+
 def test_non_all_passthrough_entries_accepted() -> None:
     yaml_text = """
 domains:

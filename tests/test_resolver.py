@@ -963,6 +963,25 @@ def test_count_transitive_lookup_cost_rejects_non_include_redirect_term() -> Non
         resolver.count_transitive_lookup_cost("exists:foo.example.com", RESOLVER_IPS)
 
 
+def test_count_transitive_lookup_cost_exceeding_max_chain_names_raises(fake_dns: FakeDNS) -> None:
+    """A passthrough include's own chain fanning out into more branches than
+    _MAX_CHAIN_NAMES allows (mirrors test_chain_exceeding_max_chain_names_raises
+    for _walk) must be refused rather than issuing that many serial DNS
+    queries -- unlike flatten(), this counter has no thread pool, so each
+    query pays its own timeout serially.
+    """
+    leaf_count = resolver._MAX_CHAIN_NAMES + 5
+    leaves = [f"leaf{i}.example.com" for i in range(leaf_count)]
+    fake_dns.txt["root.example.com"] = [
+        "v=spf1 " + " ".join(f"include:{leaf}" for leaf in leaves) + " ~all"
+    ]
+    for leaf in leaves:
+        fake_dns.txt[leaf] = ["v=spf1 ~all"]
+
+    with pytest.raises(ResolutionError, match="SPF chain too large"):
+        resolver.count_transitive_lookup_cost("include:root.example.com", RESOLVER_IPS)
+
+
 # --- Fix 3: NXDOMAIN on an a:/mx: target must not hard-fail the domain -----
 
 
@@ -1023,6 +1042,37 @@ def test_a_mechanism_target_nxdomain_does_not_fail_domain(monkeypatch: pytest.Mo
     result = flatten(["own.example.com"], RESOLVER_IPS)
 
     assert result == [net("203.0.113.1/32")]
+
+
+# --- Macro-based a:/mx: mechanisms must be rejected, not silently dropped --
+
+
+def test_a_mechanism_with_macro_host_raises(fake_dns: FakeDNS) -> None:
+    """spf53 has no SPF macro support. Without this guard, a macro-based a:
+    target would NXDOMAIN (its literal macro text isn't a real hostname) and,
+    now that NXDOMAIN softens to "no addresses" instead of hard-failing,
+    would silently drop an entire authorized sending path from the
+    flattened output instead of raising.
+    """
+    fake_dns.txt["own.example.com"] = [
+        "v=spf1 a:%{i}.allowed.provider.example ip4:198.51.100.7/32 -all"
+    ]
+
+    with pytest.raises(ResolutionError, match="own.example.com") as exc_info:
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert "a:%{i}.allowed.provider.example" in str(exc_info.value)
+
+
+def test_mx_mechanism_with_macro_host_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = [
+        "v=spf1 mx:%{i}.allowed.provider.example ip4:198.51.100.7/32 -all"
+    ]
+
+    with pytest.raises(ResolutionError, match="own.example.com") as exc_info:
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert "mx:%{i}.allowed.provider.example" in str(exc_info.value)
 
 
 # --- Fix 4: redirect= must be ignored when the record has an `all` ---------

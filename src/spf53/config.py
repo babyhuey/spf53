@@ -146,6 +146,12 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
     ):
         raise ConfigError(f"{label}: 'passthrough' must be a list of strings")
     for entry in passthrough_raw:
+        if any(ch.isspace() for ch in entry):
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} contains whitespace — "
+                "each passthrough entry is spliced verbatim into the built SPF record, "
+                "so it must be exactly one mechanism"
+            )
         if strip_qualifier(entry).lower() == "all":
             raise ConfigError(
                 f"{label}: passthrough entry {entry!r} is a bare 'all' mechanism — "

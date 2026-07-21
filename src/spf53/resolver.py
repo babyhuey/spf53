@@ -194,6 +194,7 @@ def _process_record(
         if a_match:
             _require_default_qualifier(qualifier, raw_term, name)
             host = a_match.group("host") or name
+            _require_no_macro(host, term, name)
             v4_len = _parse_len(a_match.group("len4"))
             v6_len = _parse_len(a_match.group("len6"))
             addresses = _resolve_addresses(host, resolver_ips, name, pool)
@@ -204,6 +205,7 @@ def _process_record(
         if mx_match:
             _require_default_qualifier(qualifier, raw_term, name)
             host = mx_match.group("host") or name
+            _require_no_macro(host, term, name)
             v4_len = _parse_len(mx_match.group("len4"))
             v6_len = _parse_len(mx_match.group("len6"))
             exchanges = _call_seam(_query_mx, host, resolver_ips, name)
@@ -251,6 +253,24 @@ def _require_default_qualifier(qualifier: str, raw_term: str, name: str) -> None
         )
 
 
+def _require_no_macro(host: str, term: str, name: str) -> None:
+    """Refuse to flatten an a:/mx: mechanism whose target host contains SPF
+    macro syntax ('%').
+
+    spf53 implements no macro expansion, so a macro like `a:%{i}.example`
+    would be resolved against its literal, unexpandable macro text -- which
+    is never a real hostname and always NXDOMAINs. Since NXDOMAIN on an
+    a:/mx: target now softens to "no addresses" instead of hard-failing,
+    that would silently drop the mechanism from the flattened output rather
+    than surfacing the unsupported macro.
+    """
+    if "%" in host:
+        raise ResolutionError(
+            f"cannot flatten macro-based mechanism {term!r} in {name!r} SPF record -- "
+            "spf53 does not support SPF macros; move this mechanism to 'passthrough' instead"
+        )
+
+
 def count_transitive_lookup_cost(term: str, resolver_ips: Sequence[str]) -> int:
     """Count the RFC 7208 4.6.4 lookup cost hidden inside an include:/redirect=
     term's own target SPF record -- i.e. everything beyond the 1 lookup
@@ -288,6 +308,11 @@ def _count_dns_querying_mechanisms(
         return 0
     if depth > MAX_DEPTH:
         raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
+    if len(seen) >= _MAX_CHAIN_NAMES:
+        raise ResolutionError(
+            f"SPF chain too large: exceeded {_MAX_CHAIN_NAMES} unique names "
+            f"while resolving {name!r}"
+        )
     seen.add(key)
 
     record = _get_spf_record(name, resolver_ips)
