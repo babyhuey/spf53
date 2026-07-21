@@ -146,16 +146,20 @@ spf53 will refuse to publish (and sends an SNS alert instead) when:
 - **Resolution fails outright** (NXDOMAIN, timeout, missing SPF record, a
   nesting depth over 10 `include:`s deep) for a domain. That domain is
   skipped and alerted on; other domains in the same config still run.
+- **The total SPF lookup cost exceeds the RFC 7208 hard limit of 10** —
+  chain length, plus 1 for the apex `include:`, plus any DNS-querying
+  passthrough mechanisms (`exists:`, `include:`, `a`, `mx`, `ptr`), including
+  their own transitive lookups. Exceeding 10 means real mail receivers would
+  PermError the whole domain, so spf53 refuses to publish rather than push a
+  record they can't evaluate.
 
 `spf53 apply --force` overrides a guard refusal for that run. Guard
 refusals and resolution errors always trigger an SNS notification when a
 topic is configured.
 
-spf53 also warns (in `plan` output and in SNS messages, never as a hard
-error) when the total SPF lookup cost — chain length, plus 1 for the apex
-`include:`, plus any DNS-querying passthrough mechanisms (`exists:`,
-`include:`, `a`, `mx`, `ptr`) — exceeds 9, since that's one lookup away from
-the RFC 7208 limit.
+spf53 also warns (in `plan` output and in SNS messages, before it becomes a
+hard refusal) once the total SPF lookup cost exceeds 9, since that's one
+lookup away from the RFC 7208 limit above.
 
 ## CLI reference
 

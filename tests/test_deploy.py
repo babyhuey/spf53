@@ -114,6 +114,26 @@ def test_policy_scoped_to_config_arns(tmp_path: Path) -> None:
 
 
 @mock_aws
+def test_ssm_arn_normalized_for_param_name_without_leading_slash(tmp_path: Path) -> None:
+    """SSM allows parameter names without a leading slash; the built ARN must
+    still get a "parameter/" separator, or it names no real resource and the
+    Lambda gets AccessDenied on ssm:GetParameter at runtime."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts", param_name="spf53config")
+
+    assert deploy.run_deploy(args) == 0
+
+    iam = boto3.client("iam", region_name="us-east-1")
+    doc = iam.get_role_policy(
+        RoleName=deploy._role_name("spf53"), PolicyName=deploy._policy_name("spf53")
+    )["PolicyDocument"]
+    resources = {stmt["Sid"]: stmt["Resource"] for stmt in doc["Statement"]}
+
+    account_id = boto3.client("sts", region_name="us-east-1").get_caller_identity()["Account"]
+    assert resources["SsmConfig"] == f"arn:aws:ssm:us-east-1:{account_id}:parameter/spf53config"
+
+
+@mock_aws
 def test_distinct_function_names_get_independent_iam_role_policies(tmp_path: Path) -> None:
     """A second `--function-name` deploy must not overwrite the first
     deployment's inline IAM policy: each function name gets its own role and

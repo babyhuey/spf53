@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-from spf53._spf import strip_qualifier
+from spf53._spf import match_ip_mechanism, parse_ip_literal, strip_qualifier
 
 _ALLOWED_TOP_KEYS = {"sns_topic_arn", "resolver_ips", "domains"}
 _ALLOWED_DOMAIN_KEYS = {
@@ -22,15 +22,22 @@ _ALLOWED_DOMAIN_KEYS = {
 }
 _VALID_POLICIES = ("~all", "-all")
 
-# Matches a bare (host-less) a/mx mechanism: "a", "mx", optionally followed by
-# a "/<v4-len>" and/or "//<v6-len>" dual-cidr suffix, but with no ":<host>" --
-# a colon anywhere makes the whole string not match, since there's no ":" in
-# this pattern at all.
-_BARE_A_MX_RE = re.compile(r"^(a|mx)(/\d+)?(//\d+)?$", re.IGNORECASE)
-
-# Matches a/mx/ptr/exists/include: or redirect= with an empty (or
-# whitespace-only) target after the colon/equals, e.g. "a:" or "include: ".
-_EMPTY_TARGET_RE = re.compile(r"^(a|mx|ptr|exists|include):\s*$|^redirect=\s*$", re.IGNORECASE)
+# The mechanism/modifier shapes spf53 knows how to relocate verbatim into
+# `_spf53-1.<domain>`. A passthrough entry is accepted only if it matches one
+# of these -- requiring a real, non-empty target as part of the shape itself
+# means a host-less "a"/"mx"/"ptr" and an empty "a:"/"include:"/etc. both
+# simply fail to match, with no separate "bare" or "empty-target" check
+# needed. ip4:/ip6: are handled separately via match_ip_mechanism +
+# parse_ip_literal, since "a real CIDR" isn't expressible as a regex.
+_A_MX_RE = re.compile(r"^(?:a|mx):(?P<host>[^/]+)(?:/\d+)?(?://\d+)?$", re.IGNORECASE)
+_PTR_RE = re.compile(r"^ptr:(?P<host>.+)$", re.IGNORECASE)
+_EXISTS_INCLUDE_RE = re.compile(r"^(?:exists|include):(?P<target>.+)$", re.IGNORECASE)
+# redirect= is a modifier, not a mechanism -- RFC 7208 gives it no qualifier
+# prefix -- so this is matched against the raw entry rather than the
+# qualifier-stripped one. A leading qualifier char (e.g. "+redirect=x.com")
+# is itself invalid syntax and correctly falls through to the generic
+# rejection instead of being treated as a valid redirect=.
+_REDIRECT_RE = re.compile(r"^redirect=(?P<target>.+)$", re.IGNORECASE)
 
 # Matches any %{d...} macro reference (%{d}, %{d1}, %{d2r}, %{D}, ...) --
 # the macro letter is 'd'/'D' (case-insensitive), optionally followed by
@@ -119,22 +126,59 @@ def _check_duplicate_domains(domains: Sequence[DomainConfig]) -> None:
         seen[d.name] = i
 
 
-def _is_bare_a_mx_ptr(term: str) -> bool:
-    """Whether `term` is a host-less a/mx/ptr mechanism (no explicit
-    ":target"), which implicitly refers to "the domain this record is
-    evaluated in" per RFC 7208 -- as opposed to e.g. "a:somehost.example",
-    which explicitly names a target and carries no such ambiguity.
-    """
-    return term.lower() == "ptr" or bool(_BARE_A_MX_RE.match(term))
+def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
+    """Positively validate `entry` against the mechanism/modifier shapes
+    spf53 actually knows how to relocate into `_spf53-1.<domain>`, rejecting
+    anything that doesn't match one of them.
 
-
-def _has_empty_target(term: str) -> bool:
-    """Whether `term` is a a:/mx:/ptr:/exists:/include:/redirect= mechanism
-    whose target (the part after the colon/equals) is empty or
-    whitespace-only, e.g. "a:" -- as opposed to "a:example.com", which names
-    a real target and is unambiguous.
+    This replaces blocklisting individual bad shapes one at a time -- three
+    review rounds of that kept turning up the next unblocked variant (e.g.
+    "a:/24", a lone "+", "ip4=..." with the wrong separator silently parsing
+    as an ignored modifier). A positive match list has no such gap: anything
+    not on it is rejected by default.
     """
-    return bool(_EMPTY_TARGET_RE.match(term))
+    stripped = strip_qualifier(entry)
+
+    if stripped.lower() == "all":
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} is a bare 'all' mechanism — "
+            "passthrough is placed first in chunk 1, so this would terminate SPF "
+            "evaluation immediately and make every mechanism after it (including "
+            "the chunk chain and the final policy) unreachable"
+        )
+
+    if _MACRO_D_RE.search(entry):
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} contains a '%{{d}}' macro — "
+            "%{d} expands to the domain currently being evaluated, but "
+            f"passthrough entries are spliced into '_spf53-1.{name}', not "
+            f"'{name}' itself, so after relocation it would silently expand to "
+            "the chunk record's own name instead of the domain you meant, "
+            "dropping the intended authorization"
+        )
+
+    cidr = match_ip_mechanism(entry)
+    if cidr is not None:
+        expected_version = 4 if stripped.lower().startswith("ip4:") else 6
+        try:
+            parse_ip_literal(cidr, f"passthrough entry {entry!r}", expected_version)
+        except ValueError as exc:
+            raise ConfigError(f"{label}: {exc}") from exc
+        return
+
+    if (
+        _A_MX_RE.match(stripped)
+        or _PTR_RE.match(stripped)
+        or _EXISTS_INCLUDE_RE.match(stripped)
+        or _REDIRECT_RE.match(entry)
+    ):
+        return
+
+    raise ConfigError(
+        f"{label}: passthrough entry {entry!r} is not a recognized SPF mechanism or "
+        "modifier form — spf53 only accepts ip4:/ip6:/a:/mx:/ptr:/exists:/include:/"
+        "redirect= with an explicit, non-empty target"
+    )
 
 
 def _parse_domain(index: int, raw: object) -> DomainConfig:
@@ -188,37 +232,7 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
                 "each passthrough entry is spliced verbatim into the built SPF record, "
                 "so it must be exactly one mechanism"
             )
-        if strip_qualifier(entry).lower() == "all":
-            raise ConfigError(
-                f"{label}: passthrough entry {entry!r} is a bare 'all' mechanism — "
-                "passthrough is placed first in chunk 1, so this would terminate SPF "
-                "evaluation immediately and make every mechanism after it (including "
-                "the chunk chain and the final policy) unreachable"
-            )
-        if _is_bare_a_mx_ptr(strip_qualifier(entry)):
-            raise ConfigError(
-                f"{label}: passthrough entry {entry!r} is a bare 'a'/'mx'/'ptr' "
-                "mechanism with no explicit target — a bare a/mx/ptr mechanism "
-                "implicitly refers to the domain it's evaluated in, but passthrough "
-                f"entries are spliced into '_spf53-1.{name}', not '{name}' itself — "
-                f"write it explicitly instead, e.g. 'a:{name}' or 'mx:{name}'"
-            )
-        if _has_empty_target(strip_qualifier(entry)):
-            raise ConfigError(
-                f"{label}: passthrough entry {entry!r} has an empty target — "
-                "spliced verbatim into the built record, this would publish "
-                "syntactically invalid SPF, which causes receivers to PermError "
-                "the entire domain rather than just skip this one mechanism"
-            )
-        if _MACRO_D_RE.search(entry):
-            raise ConfigError(
-                f"{label}: passthrough entry {entry!r} contains a '%{{d}}' macro — "
-                "%{d} expands to the domain currently being evaluated, but "
-                f"passthrough entries are spliced into '_spf53-1.{name}', not "
-                f"'{name}' itself, so after relocation it would silently expand to "
-                "the chunk record's own name instead of the domain you meant, "
-                "dropping the intended authorization"
-            )
+        _validate_passthrough_shape(entry, label, name)
     passthrough = tuple(passthrough_raw)
 
     policy = raw.get("policy", "~all")

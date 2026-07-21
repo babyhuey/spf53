@@ -206,7 +206,12 @@ def _inline_policy(
     function_name: str,
 ) -> dict[str, Any]:
     zone_arns = sorted({f"arn:aws:route53:::hostedzone/{d.hosted_zone_id}" for d in cfg.domains})
-    param_arn = f"arn:aws:ssm:{region}:{account_id}:parameter{param_name}"
+    # SSM allows parameter names with or without a leading slash; normalize
+    # so the ARN always gets the "parameter/" separator regardless of which
+    # form param_name is in -- without this, a non-slash name like
+    # "myconfig" glues onto "parameter" with no separator, matching no real
+    # resource.
+    param_arn = f"arn:aws:ssm:{region}:{account_id}:parameter/{param_name.lstrip('/')}"
     log_group_arn = f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{function_name}:*"
 
     statements: list[dict[str, Any]] = [

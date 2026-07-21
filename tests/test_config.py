@@ -500,6 +500,80 @@ domains:
     assert cfg.domains[0].passthrough == (value,)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a:/24",
+        "mx://64",
+        "+",
+        "-",
+        "~",
+        "ip4=1.2.3.0/24",
+        "include=x.com",
+    ],
+)
+def test_passthrough_shape_gaps_raise_config_error(value: str) -> None:
+    """Round 5, verified against pyspf: these all slipped past the round 3/4
+    blocklist checks despite being malformed or silently-wrong SPF --
+    "a:/24"/"mx://64" have a colon followed by non-empty text so the old
+    empty-target regex missed them; "+"/"-"/"~" reduce to "" after qualifier
+    stripping and matched no blocklist check; "ip4=..."/"include=..." use
+    the wrong separator and parse as an unknown, silently-ignored modifier
+    per RFC 7208, dropping the intended authorization with zero error.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert value in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ip4:203.0.113.0/24",
+        "ip6:2001:db8::/32",
+        "a:mail.example.com",
+        "exists:%{i}._spf.example.net",
+    ],
+)
+def test_well_formed_passthrough_shapes_accepted(value: str) -> None:
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == (value,)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ip4:not-a-cidr",
+        "ip4:2001:db8::/32",  # ip6 literal under an ip4: prefix
+        "ip6:203.0.113.0/24",  # ip4 literal under an ip6: prefix
+    ],
+)
+def test_invalid_ip_literal_passthrough_raises_config_error(value: str) -> None:
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
 def test_load_config_file(tmp_path: Path) -> None:
     config_path = tmp_path / "spf53.yaml"
     config_path.write_text(MINIMAL_YAML)
