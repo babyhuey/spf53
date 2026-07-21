@@ -110,8 +110,16 @@ def from_route53_value(value: str) -> list[str]:
 
 
 def _is_dns_querying_mechanism(term: str) -> bool:
-    """Whether `term` is an a/mx/ptr/include/exists mechanism (exact keyword, not a prefix)."""
+    """Whether `term` is an a/mx/ptr/include/exists mechanism (exact keyword,
+    not a prefix), or a `redirect=` modifier.
+
+    `redirect=` is syntactically a modifier (`=`-separated) rather than a
+    mechanism (`:`-separated) like the others, but RFC 7208 4.6.4 counts it
+    as one DNS-querying lookup at its own level, same as `include`.
+    """
     body = _spf.strip_qualifier(term)
+    if body.lower().startswith("redirect="):
+        return True
     cut = len(body)
     for sep in (":", "/"):
         idx = body.find(sep)

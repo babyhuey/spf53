@@ -264,6 +264,82 @@ domains:
         parse_config(yaml_text)
 
 
+def test_duplicate_domain_raises_config_error() -> None:
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z1
+    includes: [_spf.google.com]
+  - name: example.com
+    hosted_zone_id: Z2
+    includes: [amazonses.com]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_duplicate_domain_case_insensitive_raises_config_error() -> None:
+    yaml_text = """
+domains:
+  - name: Example.COM
+    hosted_zone_id: Z1
+    includes: [_spf.google.com]
+  - name: example.com.
+    hosted_zone_id: Z2
+    includes: [amazonses.com]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_three_distinct_domains_do_not_raise() -> None:
+    yaml_text = """
+domains:
+  - name: a.example.com
+    hosted_zone_id: Z1
+    includes: [_spf.google.com]
+  - name: b.example.com
+    hosted_zone_id: Z2
+    includes: [amazonses.com]
+  - name: c.example.com
+    hosted_zone_id: Z3
+    includes: [amazonses.com]
+"""
+    cfg = parse_config(yaml_text)
+    assert [d.name for d in cfg.domains] == ["a.example.com", "b.example.com", "c.example.com"]
+
+
+@pytest.mark.parametrize("value", ["all", "+all", "-all", "~all", "?all", "ALL", "-ALL"])
+def test_bare_all_passthrough_raises_config_error(value: str) -> None:
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert value in str(exc_info.value)
+
+
+def test_non_all_passthrough_entries_accepted() -> None:
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "exists:%{i}._spf.mta.salesforce.com"
+      - "ip4:203.0.113.0/24"
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == (
+        "exists:%{i}._spf.mta.salesforce.com",
+        "ip4:203.0.113.0/24",
+    )
+
+
 def test_load_config_file(tmp_path: Path) -> None:
     config_path = tmp_path / "spf53.yaml"
     config_path.write_text(MINIMAL_YAML)

@@ -29,6 +29,15 @@ _TRIES = 2
 # never submit further tasks to it from within a worker thread — nested
 # submission can exhaust all workers on blocked outer tasks and deadlock.
 _MAX_WORKERS = 8
+# RFC 7208 4.6.4: more than 10 MX records for a single "mx" mechanism is a
+# permerror condition.
+_MAX_MX_EXCHANGES = 10
+# Upper bound on unique names visited across one flatten() call, to bound
+# worst-case runtime against a hostile/misconfigured, deeply-branching
+# include chain.
+_MAX_CHAIN_NAMES = 200
+
+_QUALIFIER_NAMES = {"-": "fail", "~": "softfail", "?": "neutral"}
 
 _A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE)
 _MX_TERM_RE = re.compile(
@@ -93,6 +102,12 @@ def _walk(
     if depth > MAX_DEPTH:
         raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
 
+    if len(seen) >= _MAX_CHAIN_NAMES:
+        raise ResolutionError(
+            f"SPF chain too large: exceeded {_MAX_CHAIN_NAMES} unique names "
+            f"while resolving {name!r}"
+        )
+
     seen.add(key)
 
     record = _get_spf_record(name, resolver_ips)
@@ -102,12 +117,21 @@ def _walk(
 def _get_spf_record(name: str, resolver_ips: Sequence[str]) -> str:
     """Fetch and validate the single SPF TXT record for `name`."""
     txt_strings = _call_seam(_query_txt, name, resolver_ips, name)
-    spf_records = [s for s in txt_strings if s.strip().lower().startswith("v=spf1")]
+    spf_records = [s for s in txt_strings if _is_spf_record(s)]
     if not spf_records:
         raise ResolutionError(f"no SPF record found for {name!r}")
     if len(spf_records) > 1:
         raise ResolutionError(f"multiple SPF records found for {name!r}")
     return spf_records[0]
+
+
+def _is_spf_record(txt_string: str) -> bool:
+    """Whether a TXT string is an SPF record: exactly "v=spf1", or "v=spf1"
+    followed by a space (RFC 7208 4.5). A plain prefix match would wrongly
+    accept an unrelated record like "v=spf100 ..." as SPF.
+    """
+    stripped = txt_string.strip().lower()
+    return stripped == "v=spf1" or stripped.startswith("v=spf1 ")
 
 
 def _process_record(
@@ -119,7 +143,14 @@ def _process_record(
     networks: list[_Network],
     pool: ThreadPoolExecutor,
 ) -> None:
-    for raw_term in record.split()[1:]:  # [0] is "v=spf1"
+    raw_terms = record.split()[1:]  # [0] is "v=spf1"
+    # RFC 7208 6.1: redirect= is only used when the record has no `all`
+    # mechanism; if `all` is present it already terminates evaluation, so
+    # redirect= must be ignored below rather than followed.
+    has_all = any(_spf.strip_qualifier(t).lower() == "all" for t in raw_terms)
+
+    for raw_term in raw_terms:
+        qualifier = _spf.get_qualifier(raw_term)
         term = _spf.strip_qualifier(raw_term)
         lower = term.lower()
 
@@ -127,19 +158,29 @@ def _process_record(
             continue
         cidr = _spf.match_ip_mechanism(term)
         if cidr is not None:
+            _require_default_qualifier(qualifier, raw_term, name)
+            expected_version = 4 if lower.startswith("ip4:") else 6
             try:
-                networks.append(_spf.parse_ip_literal(cidr, f"{name!r} SPF record"))
+                networks.append(
+                    _spf.parse_ip_literal(cidr, f"{name!r} SPF record", expected_version)
+                )
             except ValueError as exc:
                 # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
-                # recovers the raw ipaddress error this message is built from.
+                # recovers the raw ipaddress error this message is built from
+                # (or, for a family-mismatch error, is None -- fall back to exc
+                # itself, which is already a complete message in that case).
                 raise ResolutionError(
-                    f"invalid CIDR literal {term!r} in {name!r} SPF record: {exc.__cause__}"
+                    f"invalid CIDR literal {term!r} in {name!r} SPF record: {exc.__cause__ or exc}"
                 ) from exc
             continue
         if lower.startswith("include:"):
+            _require_default_qualifier(qualifier, raw_term, name)
             _walk(term[8:], resolver_ips, seen, depth + 1, networks, pool)
             continue
         if lower.startswith("redirect="):
+            if has_all:
+                continue
+            _require_default_qualifier(qualifier, raw_term, name)
             _walk(term[9:], resolver_ips, seen, depth + 1, networks, pool)
             continue
         if lower.startswith("exists:"):
@@ -151,6 +192,7 @@ def _process_record(
 
         a_match = _A_TERM_RE.match(term)
         if a_match:
+            _require_default_qualifier(qualifier, raw_term, name)
             host = a_match.group("host") or name
             v4_len = _parse_len(a_match.group("len4"))
             v6_len = _parse_len(a_match.group("len6"))
@@ -160,10 +202,17 @@ def _process_record(
 
         mx_match = _MX_TERM_RE.match(term)
         if mx_match:
+            _require_default_qualifier(qualifier, raw_term, name)
             host = mx_match.group("host") or name
             v4_len = _parse_len(mx_match.group("len4"))
             v6_len = _parse_len(mx_match.group("len6"))
             exchanges = _call_seam(_query_mx, host, resolver_ips, name)
+            if len(exchanges) > _MAX_MX_EXCHANGES:
+                raise ResolutionError(
+                    f"mx mechanism {term!r} in {name!r} SPF record has {len(exchanges)} "
+                    f"MX exchanges, exceeding the RFC 7208 4.6.4 limit of "
+                    f"{_MAX_MX_EXCHANGES} for a single mx mechanism"
+                )
             # Submit each exchange's A/AAAA lookups directly rather than via
             # _resolve_addresses, so no worker ends up submitting further
             # work back onto this same pool (see _MAX_WORKERS above).
@@ -183,6 +232,82 @@ def _process_record(
         if "=" in term:
             continue  # unhandled modifier (e.g. exp=); nothing to flatten
         logger.warning("ignoring unrecognized SPF term in %s record: %s", name, term)
+
+
+def _require_default_qualifier(qualifier: str, raw_term: str, name: str) -> None:
+    """Refuse to flatten a mechanism qualified anything but '+' (the default).
+
+    Flattening e.g. `-ip4:203.0.113.9` or `~include:other.example.com` into
+    the output as a plain ip4:/include: mechanism would silently turn the
+    domain owner's explicit fail/softfail/neutral into an unconditional
+    pass. This is a deliberate, safe-by-default refusal rather than a silent
+    semantic corruption of the domain's policy.
+    """
+    if qualifier != "+":
+        raise ResolutionError(
+            f"cannot flatten {_QUALIFIER_NAMES[qualifier]}-qualified mechanism {raw_term!r} "
+            f"in {name!r} SPF record -- flattening it would silently turn its "
+            f"{_QUALIFIER_NAMES[qualifier]} into an unconditional pass"
+        )
+
+
+def count_transitive_lookup_cost(term: str, resolver_ips: Sequence[str]) -> int:
+    """Count the RFC 7208 4.6.4 lookup cost hidden inside an include:/redirect=
+    term's own target SPF record -- i.e. everything beyond the 1 lookup
+    chunker.lookup_cost already counts for the term itself.
+
+    Fetches the target's SPF TXT record and counts each DNS-querying
+    mechanism/modifier it contains: 1 each for a/mx/ptr/exists, and 1 each
+    for a nested include:/redirect= (which is then recursed into the same
+    way `_walk` recurses for flattening). Only fetches TXT records -- RFC
+    7208 lookup cost counts mechanism/modifier occurrences, not resolved
+    A/AAAA/MX addresses -- so unlike flatten() this needs no address
+    resolution and no thread pool.
+
+    Raises ResolutionError naming the failing name on any DNS failure, or if
+    the chain depth exceeds MAX_DEPTH, mirroring flatten()'s own guards.
+    """
+    stripped = _spf.strip_qualifier(term)
+    lower = stripped.lower()
+    if lower.startswith("include:"):
+        target = stripped[8:]
+    elif lower.startswith("redirect="):
+        target = stripped[9:]
+    else:
+        raise ValueError(f"not an include:/redirect= term: {term!r}")
+
+    seen: set[str] = set()
+    return _count_dns_querying_mechanisms(target, resolver_ips, seen, 1)
+
+
+def _count_dns_querying_mechanisms(
+    name: str, resolver_ips: Sequence[str], seen: set[str], depth: int
+) -> int:
+    key = name.lower()
+    if key in seen:
+        return 0
+    if depth > MAX_DEPTH:
+        raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
+    seen.add(key)
+
+    record = _get_spf_record(name, resolver_ips)
+    cost = 0
+    for raw_term in record.split()[1:]:  # [0] is "v=spf1"
+        term = _spf.strip_qualifier(raw_term)
+        lower = term.lower()
+        if lower.startswith("include:"):
+            cost += 1 + _count_dns_querying_mechanisms(term[8:], resolver_ips, seen, depth + 1)
+        elif lower.startswith("redirect="):
+            cost += 1 + _count_dns_querying_mechanisms(term[9:], resolver_ips, seen, depth + 1)
+        elif (
+            _A_TERM_RE.match(term)
+            or _MX_TERM_RE.match(term)
+            or lower == "ptr"
+            or lower.startswith("ptr:")
+            or lower.startswith("exists:")
+        ):
+            cost += 1
+    return cost
 
 
 def _wait_fail_fast(futures: Sequence[Future]) -> None:
@@ -266,9 +391,12 @@ def _query_txt(name: str, resolver_ips: Sequence[str]) -> list[str]:
 
 
 def _query_a(name: str, resolver_ips: Sequence[str]) -> list[str]:
+    # NXDOMAIN and NoAnswer are equivalent "no addresses" outcomes for an
+    # a:/mx: mechanism's target per RFC 7208 -- it simply doesn't match,
+    # rather than failing the whole domain's plan.
     try:
         answer = _resolve(name, dns.rdatatype.A, resolver_ips)
-    except dns.resolver.NoAnswer:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
         return []
     return [rdata.address for rdata in answer]
 
@@ -276,7 +404,7 @@ def _query_a(name: str, resolver_ips: Sequence[str]) -> list[str]:
 def _query_aaaa(name: str, resolver_ips: Sequence[str]) -> list[str]:
     try:
         answer = _resolve(name, dns.rdatatype.AAAA, resolver_ips)
-    except dns.resolver.NoAnswer:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
         return []
     return [rdata.address for rdata in answer]
 
@@ -284,7 +412,7 @@ def _query_aaaa(name: str, resolver_ips: Sequence[str]) -> list[str]:
 def _query_mx(name: str, resolver_ips: Sequence[str]) -> list[str]:
     try:
         answer = _resolve(name, dns.rdatatype.MX, resolver_ips)
-    except dns.resolver.NoAnswer:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
         return []
     return [str(rdata.exchange).rstrip(".") for rdata in answer]
 

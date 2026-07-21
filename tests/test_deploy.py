@@ -468,6 +468,64 @@ def test_build_lambda_zip_installs_dist_info_for_version_resolution(
         importlib.invalidate_caches()
 
 
+def test_build_lambda_zip_pins_platform_and_python_version_for_pip_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pip install used to build the dependency bundle must pin
+    --platform/--python-version/--only-binary=:all: to the Lambda runtime's
+    target, not whatever platform and interpreter `spf53 deploy` happens to
+    run under -- otherwise a compiled dependency wheel selected for the
+    deploy machine could land in the zip in a form Lambda can't execute."""
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+
+    captured_cmd: list[str] = []
+
+    def recording_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured_cmd.extend(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(deploy.subprocess, "run", recording_run)
+
+    deploy.build_lambda_zip()
+
+    assert "--platform" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--platform") + 1] == deploy.RUNTIME_PLATFORM
+    assert "--python-version" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--python-version") + 1] == deploy.RUNTIME_PYTHON_VERSION
+    assert "--only-binary=:all:" in captured_cmd
+
+
+def test_missing_pip_raises_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`uv tool install spf53` ships an isolated tool venv with no pip module
+    at all; build_lambda_zip must fail fast with an actionable MissingPipError
+    instead of letting `python -m pip install` blow up with a confusing
+    subprocess traceback."""
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+    monkeypatch.setattr(deploy, "_pip_is_available", lambda: False)
+
+    with pytest.raises(deploy.MissingPipError, match="pip"):
+        deploy.build_lambda_zip()
+
+
+@mock_aws
+def test_missing_pip_during_zip_build_returns_clean_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts")
+
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+    monkeypatch.setattr(deploy, "_pip_is_available", lambda: False)
+
+    result = deploy.run_deploy(args)
+
+    assert result == 1
+    err = capsys.readouterr().err
+    assert err.strip().startswith("spf53 deploy:")
+    assert "pip" in err
+    assert "Traceback" not in err
+
+
 def test_build_lambda_zip_locates_package_via_spf53_dunder_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

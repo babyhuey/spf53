@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import importlib.util
 import io
 import json
 import logging
@@ -34,11 +35,27 @@ logger = logging.getLogger(__name__)
 
 INVOKE_STATEMENT_ID = "spf53-schedule-permission"
 RUNTIME = "python3.13"
+RUNTIME_PYTHON_VERSION = RUNTIME.removeprefix("python")
+RUNTIME_PLATFORM = "manylinux2014_x86_64"
 HANDLER = "spf53.lambda_handler.lambda_handler"
 MEMORY_MB = 256
 TIMEOUT_S = 60
 CREATE_RETRY_ATTEMPTS = 6
 CREATE_RETRY_DELAY_S = 5
+
+
+class MissingPipError(RuntimeError):
+    """Raised when the running interpreter has no importable pip module.
+
+    Environments created by `uv tool install spf53` ship an isolated tool
+    venv with no pip at all, so the `python -m pip install --target ...`
+    call this module relies on to build the Lambda dependency bundle would
+    otherwise fail with a confusing subprocess traceback.
+    """
+
+
+def _pip_is_available() -> bool:
+    return importlib.util.find_spec("pip") is not None
 
 
 def _sized_name(name: str, limit: int, resource: str) -> str:
@@ -116,6 +133,9 @@ def run_deploy(args: argparse.Namespace) -> int:
         )
         _ensure_schedule(session, args.schedule, args.function_name, function_arn)
     except (ClientError, BotoCoreError) as exc:
+        print(f"spf53 deploy: {exc}", file=sys.stderr)
+        return 1
+    except MissingPipError as exc:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as exc:
@@ -254,10 +274,18 @@ def build_lambda_zip() -> bytes:
     provided by the Lambda runtime and is intentionally excluded. The two
     runtime deps are pinned to the versions installed in the current
     environment (rather than left to float to whatever's newest on PyPI) so
-    the zip matches what was actually tested; both work without compiled
-    extensions (pyyaml falls back to its pure-Python implementation), so
-    this stays a plain pip install with no cross-platform build flags
-    needed. spf53 itself is bundled by copying files directly rather than
+    the zip matches what was actually tested. The pip install is further
+    pinned to the Lambda runtime's actual target platform and Python
+    version (--platform/--python-version/--only-binary=:all:) rather than
+    whatever platform and interpreter `spf53 deploy` happens to run under:
+    without that, a dependency with a compiled/platform-specific wheel
+    built for the deploy machine (e.g. deploying from a Mac) could get
+    bundled in a form Lambda can't execute -- this currently only "works"
+    for pyyaml because it has a pure-Python fallback when its C extension
+    fails to import. Raises MissingPipError up front if the running
+    interpreter has no pip module at all (e.g. a `uv tool install` tool
+    venv), rather than letting that surface as an opaque subprocess
+    failure. spf53 itself is bundled by copying files directly rather than
     a `pip install <path>` of a reverse-engineered repo root: that only
     worked for editable dev installs, where __file__ happens to resolve
     under a checkout with a pyproject.toml three parents up; under a real
@@ -269,6 +297,14 @@ def build_lambda_zip() -> bytes:
     copied alongside so importlib.metadata.version("spf53") still resolves
     correctly at runtime inside the deployed Lambda.
     """
+    if not _pip_is_available():
+        raise MissingPipError(
+            "no pip module found in this Python environment; spf53 deploy needs pip "
+            "to build the Lambda dependency bundle. Run it from an environment with "
+            "pip installed -- e.g. `pip install spf53` instead of `uv tool install "
+            "spf53`, or `uv tool install spf53 --with pip`."
+        )
+
     pinned_deps = [
         f"dnspython=={importlib.metadata.version('dnspython')}",
         f"pyyaml=={importlib.metadata.version('pyyaml')}",
@@ -278,7 +314,20 @@ def build_lambda_zip() -> bytes:
 
     with tempfile.TemporaryDirectory() as build_dir:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--target", build_dir, *pinned_deps],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--target",
+                build_dir,
+                "--platform",
+                RUNTIME_PLATFORM,
+                "--python-version",
+                RUNTIME_PYTHON_VERSION,
+                "--only-binary=:all:",
+                *pinned_deps,
+            ],
             check=True,
             capture_output=True,
             text=True,

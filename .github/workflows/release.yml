@@ -65,8 +65,50 @@ jobs:
           name: dist
           path: dist/
 
-  publish:
+  smoke-test-wheel:
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install the built wheel into a fresh venv
+        run: |
+          python -m venv smoke-venv
+          smoke-venv/bin/pip install dist/*.whl
+
+      - name: Smoke test the CLI entry point
+        run: smoke-venv/bin/spf53 --help
+
+      - name: Smoke test build_lambda_zip() end to end
+        run: |
+          smoke-venv/bin/python <<'PY'
+          import io
+          import zipfile
+
+          from spf53 import deploy
+
+          zip_bytes = deploy.build_lambda_zip()
+          assert zip_bytes, "build_lambda_zip() returned an empty package"
+
+          with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+              names = zf.namelist()
+
+          assert "spf53/lambda_handler.py" in names, names
+          assert any(n.endswith(".dist-info/METADATA") for n in names), names
+          print(f"build_lambda_zip smoke test OK: {len(names)} files in package")
+          PY
+
+  publish:
+    needs: [build, smoke-test-wheel]
     if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     environment:

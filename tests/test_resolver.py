@@ -9,6 +9,8 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+import dns.rdatatype
+import dns.resolver
 import pytest
 
 from spf53 import resolver
@@ -734,7 +736,11 @@ def test_mx_term_with_more_exchanges_than_max_workers_does_not_deadlock(
     on a background thread and assert it finishes well inside a timeout,
     since a real deadlock would otherwise hang the whole test run.
     """
-    exchange_count = resolver._MAX_WORKERS + 4
+    # Must stay <= _MAX_MX_EXCHANGES (the RFC 7208 4.6.4 mx-exchange cap) while
+    # still exceeding _MAX_WORKERS, to exercise the deadlock scenario without
+    # tripping that separate cap.
+    exchange_count = resolver._MAX_MX_EXCHANGES
+    assert exchange_count > resolver._MAX_WORKERS
     exchanges = [f"mail{i}.example.com" for i in range(exchange_count)]
     fake_dns.txt["own.example.com"] = ["v=spf1 mx ~all"]
     fake_dns.mx["own.example.com"] = exchanges
@@ -789,3 +795,345 @@ def test_no_worker_futures_remain_unjoined_after_flatten_returns_on_success(
 
     assert submitted, "expected at least one future to have been submitted"
     assert all(f.done() for f in submitted)
+
+
+# --- Fix 1: qualifier stripping must not invert deny to allow --------------
+
+
+def test_fail_qualified_ip4_mechanism_raises_instead_of_flattening(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 -ip4:203.0.113.9/32 ~all"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["provider.example.com"], RESOLVER_IPS)
+
+    message = str(exc_info.value)
+    assert "provider.example.com" in message
+    assert "-ip4:203.0.113.9/32" in message
+    assert "fail" in message
+
+
+def test_softfail_qualified_include_raises_instead_of_flattening(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 ~include:other.example.com ~all"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+    message = str(exc_info.value)
+    assert "own.example.com" in message
+    assert "~include:other.example.com" in message
+    assert "softfail" in message
+
+
+def test_neutral_qualified_ip6_mechanism_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 ?ip6:2001:db8::/32 ~all"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["provider.example.com"], RESOLVER_IPS)
+
+    assert "neutral" in str(exc_info.value)
+
+
+def test_negative_qualified_a_mechanism_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 -a ~all"]
+
+    with pytest.raises(ResolutionError, match="fail"):
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+
+def test_negative_qualified_mx_mechanism_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 -mx ~all"]
+
+    with pytest.raises(ResolutionError, match="fail"):
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+
+def test_qualified_redirect_raises_instead_of_being_followed(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 ~redirect=provider.example.com"]
+    # provider.example.com is intentionally NOT registered -- if the
+    # redirect were (incorrectly) followed despite its qualifier, this would
+    # raise a "no SPF record found" error for it instead of a qualifier error.
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+    message = str(exc_info.value)
+    assert "own.example.com" in message
+    assert "softfail" in message
+
+
+def test_plus_qualified_and_unqualified_mechanisms_still_flatten(fake_dns: FakeDNS) -> None:
+    """Both an explicit '+' qualifier and no qualifier at all (the RFC 7208
+    default) must still flatten normally -- only non-'+' qualifiers refuse.
+    """
+    fake_dns.txt["provider.example.com"] = ["v=spf1 +ip4:203.0.113.1/32 ip4:203.0.113.2/32 ~all"]
+
+    result = flatten(["provider.example.com"], RESOLVER_IPS)
+
+    assert result == [net("203.0.113.1/32"), net("203.0.113.2/32")]
+
+
+# --- Fix 2: transitive lookup cost of include:/redirect= passthrough terms -
+
+
+def test_count_transitive_lookup_cost_counts_nested_dns_querying_mechanisms(
+    fake_dns: FakeDNS,
+) -> None:
+    fake_dns.txt["_spf.google.com"] = [
+        "v=spf1 include:_netblocks.google.com include:_netblocks2.google.com "
+        "include:_netblocks3.google.com ~all"
+    ]
+    fake_dns.txt["_netblocks.google.com"] = ["v=spf1 ip4:172.217.0.0/19 ~all"]
+    fake_dns.txt["_netblocks2.google.com"] = ["v=spf1 ip4:172.253.0.0/16 ~all"]
+    fake_dns.txt["_netblocks3.google.com"] = ["v=spf1 ip4:108.177.0.0/17 ~all"]
+
+    cost = resolver.count_transitive_lookup_cost("include:_spf.google.com", RESOLVER_IPS)
+
+    assert cost == 3
+
+
+def test_count_transitive_lookup_cost_recurses_multiple_levels(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["top.example.com"] = ["v=spf1 include:mid.example.com ~all"]
+    fake_dns.txt["mid.example.com"] = ["v=spf1 a mx include:leaf.example.com ~all"]
+    fake_dns.txt["leaf.example.com"] = ["v=spf1 ip4:203.0.113.0/24 ~all"]
+
+    cost = resolver.count_transitive_lookup_cost("include:top.example.com", RESOLVER_IPS)
+
+    # top.example.com's record: include:mid.example.com (+1, recurse)
+    #   mid.example.com's record: a (+1), mx (+1), include:leaf.example.com (+1, recurse)
+    #     leaf.example.com's record: ip4 only (+0)
+    # total = 1 + 1 + 1 + 1 = 4
+    assert cost == 4
+
+
+def test_count_transitive_lookup_cost_recognizes_nested_redirect(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["_spf.example.com"] = ["v=spf1 redirect=other.example.com"]
+    fake_dns.txt["other.example.com"] = ["v=spf1 ip4:203.0.113.0/24 ~all"]
+
+    cost = resolver.count_transitive_lookup_cost("include:_spf.example.com", RESOLVER_IPS)
+
+    assert cost == 1
+
+
+def test_count_transitive_lookup_cost_accepts_redirect_as_the_passthrough_term(
+    fake_dns: FakeDNS,
+) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 a mx ~all"]
+
+    cost = resolver.count_transitive_lookup_cost("redirect=provider.example.com", RESOLVER_IPS)
+
+    assert cost == 2
+
+
+def test_count_transitive_lookup_cost_is_safe_against_cycles(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["a.example.com"] = ["v=spf1 include:b.example.com ~all"]
+    fake_dns.txt["b.example.com"] = ["v=spf1 include:a.example.com ~all"]
+
+    cost = resolver.count_transitive_lookup_cost("include:a.example.com", RESOLVER_IPS)
+
+    # a -> b (+1) -> a already seen, so the revisit costs 1 for its own
+    # include: occurrence but recurses no further.
+    assert cost == 2
+
+
+def test_count_transitive_lookup_cost_exactly_max_depth_succeeds(fake_dns: FakeDNS) -> None:
+    top = _install_chain(fake_dns, MAX_DEPTH)
+
+    cost = resolver.count_transitive_lookup_cost(f"include:{top}", RESOLVER_IPS)
+
+    assert cost == MAX_DEPTH - 1
+
+
+def test_count_transitive_lookup_cost_beyond_max_depth_raises(fake_dns: FakeDNS) -> None:
+    top = _install_chain(fake_dns, MAX_DEPTH + 1)
+
+    with pytest.raises(ResolutionError, match=f"chain{MAX_DEPTH + 1}.example.com"):
+        resolver.count_transitive_lookup_cost(f"include:{top}", RESOLVER_IPS)
+
+
+def test_count_transitive_lookup_cost_dns_failure_raises_naming_it(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 include:missing.example.com ~all"]
+    # missing.example.com is intentionally absent -> DNSFailure
+
+    with pytest.raises(ResolutionError, match="missing.example.com"):
+        resolver.count_transitive_lookup_cost("include:own.example.com", RESOLVER_IPS)
+
+
+def test_count_transitive_lookup_cost_rejects_non_include_redirect_term() -> None:
+    with pytest.raises(ValueError, match="not an include"):
+        resolver.count_transitive_lookup_cost("exists:foo.example.com", RESOLVER_IPS)
+
+
+# --- Fix 3: NXDOMAIN on an a:/mx: target must not hard-fail the domain -----
+
+
+def _raise_nxdomain(
+    name: str, rdtype: dns.rdatatype.RdataType, resolver_ips: list[str]
+) -> dns.resolver.Answer:
+    raise dns.resolver.NXDOMAIN()
+
+
+def test_query_a_nxdomain_returns_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resolver, "_resolve", _raise_nxdomain)
+
+    assert resolver._query_a("gone.example.com", RESOLVER_IPS) == []
+
+
+def test_query_aaaa_nxdomain_returns_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resolver, "_resolve", _raise_nxdomain)
+
+    assert resolver._query_aaaa("gone.example.com", RESOLVER_IPS) == []
+
+
+def test_query_mx_nxdomain_returns_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resolver, "_resolve", _raise_nxdomain)
+
+    assert resolver._query_mx("gone.example.com", RESOLVER_IPS) == []
+
+
+def test_query_txt_nxdomain_still_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unlike _query_a/_query_aaaa/_query_mx, _query_txt must NOT soften
+    NXDOMAIN -- a missing include:/redirect= target is a genuine
+    misconfiguration in the SPF chain worth surfacing, not a "no addresses"
+    outcome.
+    """
+    monkeypatch.setattr(resolver, "_resolve", _raise_nxdomain)
+
+    with pytest.raises(dns.resolver.NXDOMAIN):
+        resolver._query_txt("gone.example.com", RESOLVER_IPS)
+
+
+def test_a_mechanism_target_nxdomain_does_not_fail_domain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A decommissioned a:/mx: target that NXDOMAINs must simply not match
+    (RFC 7208), not abort the whole domain's flatten() call.
+    """
+
+    def fake_query_txt(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["v=spf1 a:gone.example.com ip4:203.0.113.1/32 ~all"]
+
+    def fake_resolve(
+        name: str, rdtype: dns.rdatatype.RdataType, resolver_ips: list[str]
+    ) -> dns.resolver.Answer:
+        if rdtype == dns.rdatatype.A:
+            raise dns.resolver.NXDOMAIN()
+        raise dns.resolver.NoAnswer()
+
+    monkeypatch.setattr(resolver, "_query_txt", fake_query_txt)
+    monkeypatch.setattr(resolver, "_resolve", fake_resolve)
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("203.0.113.1/32")]
+
+
+# --- Fix 4: redirect= must be ignored when the record has an `all` ---------
+
+
+def test_redirect_ignored_when_record_has_all(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 ip4:203.0.113.1/32 -all redirect=other.example.com"]
+    # other.example.com is intentionally NOT registered -- if redirect= were
+    # (incorrectly) followed, this would raise ResolutionError for it.
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("203.0.113.1/32")]
+
+
+def test_redirect_ignored_regardless_of_term_order_relative_to_all(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 redirect=other.example.com ip4:203.0.113.1/32 -all"]
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("203.0.113.1/32")]
+
+
+# --- v=spf1 prefix must be boundary-anchored --------------------------------
+
+
+def test_v_spf100_lookalike_record_is_not_treated_as_spf(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = [
+        "v=spf100 not-actually-spf",
+        "v=spf1 ip4:198.51.100.1/32 ~all",
+    ]
+
+    result = flatten(["provider.example.com"], RESOLVER_IPS)
+
+    assert result == [net("198.51.100.1/32")]
+
+
+# --- ip4/ip6 family mismatch must raise, not be silently accepted ----------
+
+
+def test_ip4_prefix_with_ipv6_literal_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 ip4:2001:db8::/32 ~all"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["provider.example.com"], RESOLVER_IPS)
+
+    message = str(exc_info.value)
+    assert "provider.example.com" in message
+    assert "2001:db8::/32" in message
+
+
+def test_ip6_prefix_with_ipv4_literal_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["provider.example.com"] = ["v=spf1 ip6:203.0.113.0/24 ~all"]
+
+    with pytest.raises(ResolutionError) as exc_info:
+        flatten(["provider.example.com"], RESOLVER_IPS)
+
+    assert "provider.example.com" in str(exc_info.value)
+
+
+# --- Self-DoS caps -----------------------------------------------------------
+
+
+def test_mx_mechanism_with_more_than_ten_exchanges_raises(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 mx ~all"]
+    fake_dns.mx["own.example.com"] = [f"mail{i}.example.com" for i in range(11)]
+
+    with pytest.raises(ResolutionError, match="own.example.com"):
+        flatten(["own.example.com"], RESOLVER_IPS)
+
+
+def test_mx_mechanism_with_exactly_ten_exchanges_succeeds(fake_dns: FakeDNS) -> None:
+    fake_dns.txt["own.example.com"] = ["v=spf1 mx ~all"]
+    exchanges = [f"mail{i}.example.com" for i in range(10)]
+    fake_dns.mx["own.example.com"] = exchanges
+    for i, exchange in enumerate(exchanges):
+        # Spaced-out last octets so no two /32s are adjacent and collapsed
+        # by ipaddress.collapse_addresses into fewer, wider CIDRs.
+        fake_dns.a[exchange] = [f"198.51.100.{i * 10}"]
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert len(result) == 10
+
+
+def test_chain_exceeding_max_chain_names_raises(fake_dns: FakeDNS) -> None:
+    """A root record fanning out into more branches than _MAX_CHAIN_NAMES
+    allows (all well within MAX_DEPTH, so the depth cap can't be what stops
+    it) must be refused rather than allowed to run unbounded.
+    """
+    leaf_count = resolver._MAX_CHAIN_NAMES + 5
+    leaves = [f"leaf{i}.example.com" for i in range(leaf_count)]
+    fake_dns.txt["root.example.com"] = [
+        "v=spf1 " + " ".join(f"include:{leaf}" for leaf in leaves) + " ~all"
+    ]
+    for leaf in leaves:
+        fake_dns.txt[leaf] = ["v=spf1 ~all"]
+
+    with pytest.raises(ResolutionError, match="SPF chain too large"):
+        flatten(["root.example.com"], RESOLVER_IPS)
+
+
+def test_chain_at_exactly_max_chain_names_succeeds(fake_dns: FakeDNS) -> None:
+    leaf_count = resolver._MAX_CHAIN_NAMES - 1  # + root itself = _MAX_CHAIN_NAMES
+    leaves = [f"leaf{i}.example.com" for i in range(leaf_count)]
+    fake_dns.txt["root.example.com"] = [
+        "v=spf1 " + " ".join(f"include:{leaf}" for leaf in leaves) + " ~all"
+    ]
+    for leaf in leaves:
+        fake_dns.txt[leaf] = ["v=spf1 ~all"]
+
+    result = flatten(["root.example.com"], RESOLVER_IPS)
+
+    assert result == []

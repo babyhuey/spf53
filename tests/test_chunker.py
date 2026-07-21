@@ -189,3 +189,17 @@ def test_is_dns_querying_mechanism_accepts_real_mechanisms_with_and_without_qual
         "~mx:host",
     ]:
         assert chunker._is_dns_querying_mechanism(term) is True, term
+
+
+def test_is_dns_querying_mechanism_recognizes_redirect_modifier() -> None:
+    """redirect= is syntactically a modifier (`=`-separated), not a
+    mechanism, but RFC 7208 4.6.4 counts it as one DNS-querying lookup.
+    """
+    assert chunker._is_dns_querying_mechanism("redirect=other.example.com") is True
+
+
+def test_lookup_cost_counts_redirect_passthrough_as_dns_querying() -> None:
+    passthrough = ["redirect=other.example.com"]
+    records = chunker.build_records(DOMAIN, [], passthrough, "~all")
+    cost = chunker.lookup_cost(records, passthrough)
+    assert cost == len(records) + 1

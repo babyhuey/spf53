@@ -122,7 +122,10 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
         return f"{dc.name}: {exc}"
 
     shrink_guard = guards.check_guards(live_networks, comparison_networks, dc.max_shrink_pct)
-    lookup_cost = chunker.lookup_cost(desired, dc.passthrough)
+    try:
+        lookup_cost = _total_lookup_cost(desired, dc.passthrough, resolver_ips)
+    except ResolutionError as exc:
+        return f"{dc.name}: {exc}"
     cost_guard = guards.check_lookup_cost(lookup_cost)
     guard = GuardResult(
         ok=shrink_guard.ok and cost_guard.ok,
@@ -147,6 +150,25 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
         ),
         delete_ttls=delete_ttls,
     )
+
+
+def _total_lookup_cost(
+    desired: dict[str, list[str]], passthrough: Sequence[str], resolver_ips: Sequence[str]
+) -> int:
+    """chunker.lookup_cost()'s flat "+1 per DNS-querying passthrough mechanism"
+    undercounts include:/redirect= passthrough terms, whose real RFC 7208
+    4.6.4 cost is transitive: they point at another domain's own SPF record,
+    so on top of the 1 chunker.lookup_cost already counts for the term
+    itself, add however many DNS-querying mechanisms that target's record
+    (recursively) contains, via resolver.count_transitive_lookup_cost.
+    """
+    cost = chunker.lookup_cost(desired, passthrough)
+    for term in passthrough:
+        stripped = _spf.strip_qualifier(term)
+        lower = stripped.lower()
+        if lower.startswith("include:") or lower.startswith("redirect="):
+            cost += resolver.count_transitive_lookup_cost(term, resolver_ips)
+    return cost
 
 
 def apply(cfg: Spf53Config, force: bool = False) -> RunResult:
@@ -226,12 +248,17 @@ def _parse_ip_token(raw_token: str, context: str) -> IPNetwork | None:
     # consumed prefix is always token's first 4 chars, lowercased to match
     # this module's existing (lowercase-only) error message convention.
     prefix = token[:4].lower()
+    expected_version = 4 if prefix == "ip4:" else 6
     try:
-        return _spf.parse_ip_literal(cidr, context)
+        return _spf.parse_ip_literal(cidr, context, expected_version)
     except ValueError as exc:
         # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
-        # recovers the raw ipaddress error this message is built from.
-        raise ValueError(f"invalid {prefix} token {token!r} in {context}: {exc.__cause__}") from exc
+        # recovers the raw ipaddress error this message is built from (or,
+        # for a family-mismatch error, is None -- fall back to exc itself,
+        # which is already a complete message in that case).
+        raise ValueError(
+            f"invalid {prefix} token {token!r} in {context}: {exc.__cause__ or exc}"
+        ) from exc
 
 
 def _networks_from_records(records: dict[str, list[str]]) -> list[IPNetwork]:

@@ -8,6 +8,15 @@ from typing import Any
 from spf53 import _boto, chunker
 
 
+class AmbiguousTxtRecordError(ValueError):
+    """Raised when an spf53-owned TXT rrset has more than one ResourceRecord.
+
+    A subclass of ValueError so it's caught by the same per-domain error
+    handling that already covers other ValueErrors from this module's output
+    (e.g. chunker.from_route53_value's malformed-value errors).
+    """
+
+
 def _client() -> Any:
     return _boto.get_client("route53")
 
@@ -32,10 +41,28 @@ def get_txt_records(zone_id: str, domain: str) -> tuple[dict[str, list[str]], di
             if rrset["Type"] != "TXT":
                 continue
             name = rrset["Name"].rstrip(".")
-            if name != domain and not chunk_re.match(name):
+            is_chunk = chunk_re.match(name)
+            if name != domain and not is_chunk:
                 continue
+            resource_records = rrset.get("ResourceRecords", [])
+            if is_chunk and len(resource_records) > 1:
+                # spf53 only ever writes a chunk rrset as a single
+                # ResourceRecord (whose Value may itself hold up to
+                # MAX_STRINGS_PER_RECORD concatenated character-strings, see
+                # chunker.py). Multiple separate ResourceRecords here is
+                # foreign, ambiguous state -- e.g. leftover from another
+                # flattener -- that apply_changes' DELETE (built as a single
+                # ResourceRecord) can't reconstruct. Refuse rather than
+                # silently concatenating and risking a rejected change batch
+                # or a false "no change" diff.
+                raise AmbiguousTxtRecordError(
+                    f"{name!r} has {len(resource_records)} separate Route53 "
+                    "ResourceRecords in one TXT rrset, which spf53 does not "
+                    "manage -- clean it up manually in Route53 before spf53 "
+                    "can manage this record again"
+                )
             strings: list[str] = []
-            for rr in rrset.get("ResourceRecords", []):
+            for rr in resource_records:
                 strings.extend(chunker.from_route53_value(rr["Value"]))
             records[name] = strings
             ttls[name] = rrset["TTL"]

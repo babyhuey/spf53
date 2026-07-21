@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+from spf53._spf import strip_qualifier
 
 _ALLOWED_TOP_KEYS = {"sns_topic_arn", "resolver_ips", "domains"}
 _ALLOWED_DOMAIN_KEYS = {
@@ -61,6 +64,7 @@ def parse_config(yaml_text: str) -> Spf53Config:
     if not isinstance(domains_raw, list) or not domains_raw:
         raise ConfigError("'domains' must be a non-empty list")
     domains = tuple(_parse_domain(i, d) for i, d in enumerate(domains_raw))
+    _check_duplicate_domains(domains)
 
     sns_topic_arn = raw.get("sns_topic_arn")
     if sns_topic_arn is not None and not isinstance(sns_topic_arn, str):
@@ -79,6 +83,24 @@ def parse_config(yaml_text: str) -> Spf53Config:
         resolver_ips = ("1.1.1.1", "8.8.8.8")
 
     return Spf53Config(domains=domains, sns_topic_arn=sns_topic_arn, resolver_ips=resolver_ips)
+
+
+def _check_duplicate_domains(domains: Sequence[DomainConfig]) -> None:
+    """Reject configs that list the same domain twice.
+
+    Domain names are already lowercased by _parse_domain, so a plain
+    equality check is case-insensitive. Two entries for the same domain
+    would otherwise race concurrently over the same Route53 rrsets in
+    core.py's domain pool.
+    """
+    seen: dict[str, int] = {}
+    for i, d in enumerate(domains):
+        if d.name in seen:
+            raise ConfigError(
+                f"duplicate domain {d.name!r}: domains[{seen[d.name]}] and domains[{i}] "
+                "both configure the same domain"
+            )
+        seen[d.name] = i
 
 
 def _parse_domain(index: int, raw: object) -> DomainConfig:
@@ -123,6 +145,14 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
         isinstance(x, str) for x in passthrough_raw
     ):
         raise ConfigError(f"{label}: 'passthrough' must be a list of strings")
+    for entry in passthrough_raw:
+        if strip_qualifier(entry).lower() == "all":
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} is a bare 'all' mechanism — "
+                "passthrough is placed first in chunk 1, so this would terminate SPF "
+                "evaluation immediately and make every mechanism after it (including "
+                "the chunk chain and the final policy) unreachable"
+            )
     passthrough = tuple(passthrough_raw)
 
     policy = raw.get("policy", "~all")

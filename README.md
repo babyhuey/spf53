@@ -116,7 +116,7 @@ or the value of an SSM parameter (`--ssm-param`, default `/spf53/config`).
 
 | Key | Required | Default | Description |
 |---|---|---|---|
-| `domains` | yes | — | List of domain blocks (see below). |
+| `domains` | yes | — | List of domain blocks (see below). Domain names must be unique (case-insensitive). |
 | `sns_topic_arn` | no | none | Where alerts are published. No alerts if absent. |
 | `resolver_ips` | no | `["1.1.1.1", "8.8.8.8"]` | DNS resolvers used for flattening, queried alternately with retries. |
 
@@ -127,7 +127,7 @@ Each entry in `domains`:
 | `name` | yes | — | The domain whose SPF is being flattened. |
 | `hosted_zone_id` | yes | — | Route53 hosted zone ID for this domain. No zone auto-discovery. |
 | `includes` | yes | — | Provider `include:` targets to recursively resolve and flatten. |
-| `passthrough` | no | `[]` | Mechanisms copied verbatim, never flattened, placed first in chunk 1. |
+| `passthrough` | no | `[]` | Mechanisms copied verbatim, never flattened, placed first in chunk 1. A bare `all` mechanism (any qualifier) is rejected — it would terminate SPF evaluation before the chunk chain. |
 | `policy` | no | `"~all"` | SPF policy for the last chunk; must be `"~all"` or `"-all"`. |
 | `max_shrink_pct` | no | `30` | Guard threshold — see below. |
 

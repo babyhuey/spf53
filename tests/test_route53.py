@@ -293,6 +293,72 @@ def test_apply_changes_delete_with_wrong_ttl_fails_whole_batch(zone_id: str) -> 
     assert f"_spf53-2.{DOMAIN}" not in result
 
 
+def test_get_txt_records_raises_on_ambiguous_multi_resource_record_chunk(zone_id: str) -> None:
+    """A chunk name with more than one separate Route53 ResourceRecord in its
+    rrset is unsafe/ambiguous state (e.g. leftover from another flattener)
+    that apply_changes' single-ResourceRecord DELETE can't reconstruct --
+    get_txt_records must refuse rather than silently concatenating.
+    """
+    client = boto3.client("route53", region_name="us-east-1")
+    client.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {
+                        "Name": f"_spf53-1.{DOMAIN}",
+                        "Type": "TXT",
+                        "TTL": 300,
+                        "ResourceRecords": [
+                            {"Value": chunker.to_route53_value(["v=spf1 ip4:1.2.3.0/24 ~all"])},
+                            {"Value": chunker.to_route53_value(["v=spf1 ip4:5.6.7.0/24 ~all"])},
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(route53.AmbiguousTxtRecordError, match=f"_spf53-1.{DOMAIN}"):
+        route53.get_txt_records(zone_id, DOMAIN)
+
+
+def test_get_txt_records_allows_multi_resource_record_apex(zone_id: str) -> None:
+    """The apex record isn't spf53-owned/managed (only _spf53-N chunk
+    records are), so multiple ResourceRecords there must still be read, not
+    rejected.
+    """
+    client = boto3.client("route53", region_name="us-east-1")
+    client.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Changes": [
+                {
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {
+                        "Name": DOMAIN,
+                        "Type": "TXT",
+                        "TTL": 300,
+                        "ResourceRecords": [
+                            {
+                                "Value": chunker.to_route53_value(
+                                    ["v=spf1 include:_spf53-1.example.com ~all"]
+                                )
+                            },
+                            {"Value": chunker.to_route53_value(["unrelated-verification-record"])},
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+
+    result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
+
+    assert DOMAIN in result
+
+
 def test_boto_get_client_constructs_once_under_concurrent_cold_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

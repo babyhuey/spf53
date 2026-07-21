@@ -297,6 +297,17 @@ def test_parse_ip_token_uppercase_prefix_and_mixed_case_hex() -> None:
     )
 
 
+def test_parse_ip_token_family_mismatch_raises() -> None:
+    """ip4:<ipv6-literal> (or vice versa) is a permerror in the source
+    record -- must raise, not silently emit under the wrong family.
+    """
+    with pytest.raises(ValueError, match="IPv6"):
+        core._parse_ip_token("ip4:2001:db8::/32", "test context")
+
+    with pytest.raises(ValueError, match="IPv4"):
+        core._parse_ip_token("ip6:203.0.113.0/24", "test context")
+
+
 def test_passthrough_networks_uppercase_prefix_is_recognized() -> None:
     networks = core._passthrough_networks(["IP4:203.0.113.0/24"])
 
@@ -590,6 +601,36 @@ def test_apply_chunk_build_error_notifies_and_continues(monkeypatch: pytest.Monk
     assert any("applied" in s.lower() for s in subjects)
 
 
+def test_plan_ambiguous_txt_record_error_isolated_to_its_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route53.AmbiguousTxtRecordError (raised for a chunk name with more
+    than one separate ResourceRecord in its rrset) is a ValueError subclass,
+    so it must be caught by the same per-domain isolation that already
+    covers other ValueErrors from route53.get_txt_records.
+    """
+    bad = _domain(name="bad.example")
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+
+    def fake_get_txt_records(zone_id: str, domain: str) -> tuple[dict, dict]:
+        if domain == "bad.example":
+            raise route53.AmbiguousTxtRecordError(
+                "'_spf53-1.bad.example' has 2 separate Route53 ResourceRecords in one TXT rrset"
+            )
+        return {}, {}
+
+    monkeypatch.setattr(route53, "get_txt_records", fake_get_txt_records)
+
+    result = core.plan(_cfg([bad, good]))
+
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    assert len(result.plans) == 1
+    assert result.plans[0].domain == "good.example"
+
+
 def test_plan_route53_read_error_isolated_to_its_domain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -843,6 +884,94 @@ def test_plan_lookup_cost_over_rfc7208_limit_refused_despite_no_shrink(
     assert p.lookup_cost == 11
     assert p.guard.ok is False
     assert any("RFC 7208" in reason for reason in p.guard.reasons)
+
+
+# --- Fix 2: total lookup cost must include transitive include:/redirect= ---
+
+
+def test_plan_lookup_cost_includes_transitive_cost_of_include_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An include:/redirect= passthrough term's real lookup cost is
+    transitive -- core.py must add resolver.count_transitive_lookup_cost's
+    result on top of chunker.lookup_cost's flat "+1" for the term itself.
+    """
+    dc = _domain(passthrough=("include:_spf.google.com",))
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+    monkeypatch.setattr(resolver, "count_transitive_lookup_cost", lambda term, ips: 3)
+
+    result = core.plan(_cfg([dc]))
+
+    p = result.plans[0]
+    # len(records)=1 + flat 1 (the include: term itself) + transitive 3 = 5
+    assert p.lookup_cost == 5
+
+
+def test_plan_lookup_cost_includes_transitive_cost_of_redirect_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dc = _domain(passthrough=("redirect=other.example.com",))
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+    monkeypatch.setattr(resolver, "count_transitive_lookup_cost", lambda term, ips: 2)
+
+    result = core.plan(_cfg([dc]))
+
+    p = result.plans[0]
+    # len(records)=1 + flat 1 (the redirect= term itself) + transitive 2 = 4
+    assert p.lookup_cost == 4
+
+
+def test_plan_lookup_cost_does_not_call_transitive_counter_for_terminal_mechanisms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """a:/mx:/exists:/ptr passthrough terms are terminal -- they have no SPF
+    chain of their own to recurse into, so they must still count as a flat 1
+    without ever calling resolver.count_transitive_lookup_cost.
+    """
+    dc = _domain(passthrough=("a:mail.example.com", "mx", "exists:foo", "ptr:bar"))
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    calls: list[str] = []
+
+    def fake_count(term: str, ips: object) -> int:
+        calls.append(term)
+        return 99
+
+    monkeypatch.setattr(resolver, "count_transitive_lookup_cost", fake_count)
+
+    result = core.plan(_cfg([dc]))
+
+    p = result.plans[0]
+    assert calls == []
+    assert p.lookup_cost == len(p.desired) + 4
+
+
+def test_plan_transitive_lookup_cost_resolution_error_isolated_to_its_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = _domain(name="bad.example", passthrough=("include:broken.example.com",))
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    def fake_count(term: str, ips: object) -> int:
+        raise ResolutionError("bad.example: broken.example.com failed to resolve")
+
+    monkeypatch.setattr(resolver, "count_transitive_lookup_cost", fake_count)
+
+    result = core.plan(_cfg([bad, good]))
+
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    assert len(result.plans) == 1
+    assert result.plans[0].domain == "good.example"
 
 
 # --- Finding 3: a policy-only change must show up in the summary -----------
