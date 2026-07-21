@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import functools
 import re
 from typing import Any
 
-import boto3
-
-from spf53 import chunker
+from spf53 import _boto, chunker
 
 
-@functools.cache
 def _client() -> Any:
-    return boto3.client("route53")
+    return _boto.get_client("route53")
 
 
 def get_txt_records(zone_id: str, domain: str) -> tuple[dict[str, list[str]], dict[str, int]]:

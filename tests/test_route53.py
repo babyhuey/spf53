@@ -291,3 +291,46 @@ def test_apply_changes_delete_with_wrong_ttl_fails_whole_batch(zone_id: str) -> 
     # the atomic batch was rejected, so the bundled upsert never landed either
     result, _ttls = route53.get_txt_records(zone_id, DOMAIN)
     assert f"_spf53-2.{DOMAIN}" not in result
+
+
+def test_boto_get_client_constructs_once_under_concurrent_cold_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """functools.cache does not guarantee its wrapped function runs only once
+    under concurrent calls before the first result is cached — core.py's
+    per-domain ThreadPoolExecutor can race multiple threads through a cold
+    client cache. _boto.get_client uses double-checked locking instead, so
+    N threads racing a cold cache entry must still construct the underlying
+    boto3 client exactly once."""
+    import threading
+    import time
+
+    from spf53 import _boto
+
+    n_threads = 16
+    call_count = 0
+    count_lock = threading.Lock()
+    start_barrier = threading.Barrier(n_threads)
+    real_boto3_client = boto3.client
+
+    def slow_counting_client(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        with count_lock:
+            call_count += 1
+        time.sleep(0.05)  # widen the race window a naive cache would fall through
+        return real_boto3_client(*args, **kwargs)
+
+    monkeypatch.setattr(boto3, "client", slow_counting_client)
+    monkeypatch.setattr(_boto, "_clients", {})
+
+    def worker() -> None:
+        start_barrier.wait()  # line every thread up to hit the cold cache together
+        _boto.get_client("route53")
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert call_count == 1

@@ -265,6 +265,24 @@ def test_plan_corrupt_live_token_isolated_to_its_domain(
     assert result.plans[0].domain == "good.example"
 
 
+def test_networks_from_records_strips_spf_qualifiers() -> None:
+    """A qualified ip4/ip6 mechanism (e.g. from a passthrough entry placed
+    verbatim into a live record) must still be recognized, or the guard's
+    live_networks baseline silently undercounts.
+    """
+    records = {
+        "_spf53-1.example.com": ["v=spf1 +ip4:203.0.113.0/24 -ip4:198.51.100.0/24 ~all"],
+        "_spf53-2.example.com": ["v=spf1 ip6:2001:db8::/32 ~all"],
+    }
+
+    networks = core._networks_from_records(records)
+
+    assert ipaddress.ip_network("203.0.113.0/24") in networks
+    assert ipaddress.ip_network("198.51.100.0/24") in networks
+    assert ipaddress.ip_network("2001:db8::/32") in networks
+    assert len(networks) == 3
+
+
 def test_apex_warning_absent_apex_still_a_warning_not_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,6 +429,34 @@ def test_apply_chunk_build_error_notifies_and_continues(monkeypatch: pytest.Monk
     subjects = [c[0][1] for c in notify_calls]
     assert any("resolution failed" in s.lower() for s in subjects)  # SNS fired for the run error
     assert any("applied" in s.lower() for s in subjects)
+
+
+def test_plan_route53_read_error_isolated_to_its_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from botocore.exceptions import ClientError
+
+    bad = _domain(name="bad.example")
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+
+    def fake_get_txt_records(zone_id: str, domain: str) -> tuple[dict, dict]:
+        if domain == "bad.example":
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "not authorized"}},
+                "ListResourceRecordSets",
+            )
+        return {}, {}
+
+    monkeypatch.setattr(route53, "get_txt_records", fake_get_txt_records)
+
+    result = core.plan(_cfg([bad, good]))
+
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    assert len(result.plans) == 1
+    assert result.plans[0].domain == "good.example"
 
 
 def test_plan_preserves_cfg_domains_order_despite_out_of_order_completion(

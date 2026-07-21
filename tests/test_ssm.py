@@ -81,3 +81,18 @@ def test_put_config_ssm_stores_as_string_type() -> None:
 def test_load_config_ssm_missing_param_raises() -> None:
     with pytest.raises(ClientError):
         load_config_ssm()
+
+
+@mock_aws
+def test_put_and_load_config_ssm_respect_region() -> None:
+    """The region parameter must route the SSM call to that region instead
+    of always using the ambient default, so deploy.py's --region flag can
+    actually reach the parameter it writes."""
+    put_config_ssm(VALID_YAML, region="eu-west-1")
+
+    cfg = load_config_ssm(region="eu-west-1")
+    assert cfg == parse_config(VALID_YAML)
+
+    default_region_client = boto3.client("ssm", region_name="us-east-1")
+    with pytest.raises(ClientError):
+        default_region_client.get_parameter(Name=DEFAULT_PARAM)

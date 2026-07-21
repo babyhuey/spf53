@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-import functools
 import logging
 from typing import Any
 
-import boto3
+from spf53 import _boto
 
 logger = logging.getLogger(__name__)
 
 MAX_SUBJECT_LEN = 100
 
 
-@functools.cache
 def _client() -> Any:
-    return boto3.client("sns")
+    return _boto.get_client("sns")
 
 
 def publish(topic_arn: str | None, subject: str, message: str) -> None:

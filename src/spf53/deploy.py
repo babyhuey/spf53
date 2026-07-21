@@ -12,7 +12,6 @@ import importlib.metadata
 import io
 import json
 import logging
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -79,7 +78,11 @@ def run_deploy(args: argparse.Namespace) -> int:
     try:
         yaml_text = Path(args.config).read_text()
         cfg = parse_config(yaml_text)
-    except (ConfigError, OSError) as exc:
+        _role_name(args.function_name)
+        _policy_name(args.function_name)
+        _rule_name(args.function_name)
+        _target_id(args.function_name)
+    except (ConfigError, OSError, ValueError) as exc:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
         return 1
 
@@ -95,7 +98,7 @@ def run_deploy(args: argparse.Namespace) -> int:
             yaml_text = _inject_topic_arn(yaml_text, new_topic_arn)
         topic_arn = cfg.sns_topic_arn or new_topic_arn
 
-        put_config_ssm(yaml_text, param_name=args.param_name)
+        put_config_ssm(yaml_text, param_name=args.param_name, region=args.region)
         print(f"pushed config to SSM parameter {args.param_name}")
 
         account_id = session.client("sts").get_caller_identity()["Account"]
@@ -244,14 +247,19 @@ def build_lambda_zip() -> bytes:
     """Build the Lambda deployment package.
 
     Bundles dnspython, pyyaml, and the spf53 package itself. boto3 is
-    provided by the Lambda runtime and is intentionally excluded. Both deps
-    are pinned to the versions installed in the current environment (rather
-    than left to float to whatever's newest on PyPI) so the zip matches what
-    was actually tested; both work without compiled extensions (pyyaml falls
-    back to its pure-Python implementation), so this stays a plain
-    pip install with no cross-platform build flags needed.
+    provided by the Lambda runtime and is intentionally excluded. The two
+    runtime deps are pinned to the versions installed in the current
+    environment (rather than left to float to whatever's newest on PyPI) so
+    the zip matches what was actually tested; both work without compiled
+    extensions (pyyaml falls back to its pure-Python implementation), so
+    this stays a plain pip install with no cross-platform build flags
+    needed. spf53 itself is also installed via pip (rather than a raw
+    directory copy) so the zip carries real .dist-info metadata, letting
+    importlib.metadata.version("spf53") resolve correctly at runtime inside
+    the deployed Lambda; --no-deps keeps it from re-resolving dnspython/
+    pyyaml a second time since those are already installed explicitly above.
     """
-    pkg_dir = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parent.parent.parent
     pinned_deps = [
         f"dnspython=={importlib.metadata.version('dnspython')}",
         f"pyyaml=={importlib.metadata.version('pyyaml')}",
@@ -263,8 +271,20 @@ def build_lambda_zip() -> bytes:
             capture_output=True,
             text=True,
         )
-        shutil.copytree(
-            pkg_dir, Path(build_dir) / "spf53", ignore=shutil.ignore_patterns("__pycache__")
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--target",
+                build_dir,
+                "--no-deps",
+                str(repo_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
         buffer = io.BytesIO()

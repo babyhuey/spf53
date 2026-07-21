@@ -242,6 +242,74 @@ def test_existing_sns_topic_arn_in_config_is_not_overwritten(tmp_path: Path) -> 
     assert boto3.client("sns", region_name="us-east-1").list_topics()["Topics"] == []
 
 
+@mock_aws
+def test_put_config_ssm_called_with_deploy_region(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_deploy must forward --region into put_config_ssm: every other AWS
+    call in run_deploy goes through the region-scoped boto3.Session, but the
+    SSM push previously went through ssm.py's own region-blind client cache
+    and silently landed in the ambient default region instead of --region.
+    Uses eu-west-1 (not conftest.py's us-east-1 default) so a regression
+    that drops the region argument can't coincidentally still pass."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, region="eu-west-1")
+
+    calls: list[dict[str, object]] = []
+    real_put_config_ssm = deploy.put_config_ssm
+
+    def spy_put_config_ssm(yaml_text: str, *, param_name: str, region: str | None = None) -> None:
+        calls.append({"param_name": param_name, "region": region})
+        real_put_config_ssm(yaml_text, param_name=param_name, region=region)
+
+    monkeypatch.setattr(deploy, "put_config_ssm", spy_put_config_ssm)
+
+    assert deploy.run_deploy(args) == 0
+    assert calls == [{"param_name": "/spf53/config", "region": "eu-west-1"}]
+
+
+@mock_aws
+def test_deploy_writes_ssm_param_in_requested_region(tmp_path: Path) -> None:
+    """End-to-end companion to the spy test above: the pushed config must
+    actually be readable back from eu-west-1, and absent from the ambient
+    default region (us-east-1) it would have landed in before the fix."""
+    from botocore.exceptions import ClientError
+
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, region="eu-west-1")
+
+    assert deploy.run_deploy(args) == 0
+
+    eu_param = boto3.client("ssm", region_name="eu-west-1").get_parameter(Name="/spf53/config")[
+        "Parameter"
+    ]
+    assert eu_param["Value"]
+
+    with pytest.raises(ClientError):
+        boto3.client("ssm", region_name="us-east-1").get_parameter(Name="/spf53/config")
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_oversized_function_name_returns_clean_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], dry_run: bool
+) -> None:
+    """An oversized --function-name must fail with a one-line stderr message
+    and exit code 1 in both --dry-run and real-apply modes, not an unhandled
+    ValueError traceback (_print_plan, called before the AWS-calls try
+    block, also derives these names, so both paths need the upfront check)."""
+    config_path = _write_config(tmp_path)
+    oversized_name = "x" * 60  # "{name}-lambda" is 67 chars, over the 64-char IAM role limit
+    args = _make_args(config_path, function_name=oversized_name, dry_run=dry_run)
+
+    result = deploy.run_deploy(args)
+
+    assert result == 1
+    err = capsys.readouterr().err
+    assert err.strip().startswith("spf53 deploy:")
+    assert "IAM role" in err
+    assert "Traceback" not in err
+
+
 def test_missing_config_file_returns_error(tmp_path: Path) -> None:
     args = _make_args(tmp_path / "does-not-exist.yaml")
 
@@ -328,3 +396,36 @@ def test_pip_failure_during_zip_build_returns_clean_error(
     assert "spf53 deploy: failed to build Lambda package:" in err
     assert "dnspython==9.9.9" in err
     assert "Traceback" not in err
+
+
+def test_build_lambda_zip_installs_dist_info_for_version_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """build_lambda_zip must pip-install spf53 itself (not raw-copy the
+    source tree) so the zip carries real .dist-info metadata and
+    importlib.metadata.version("spf53") resolves inside the deployed Lambda
+    instead of falling back to __init__.py's "0.0.0-dev". Also confirms the
+    spf53/ package still lands at the path HANDLER needs to import it from."""
+    import importlib.metadata
+    import io
+    import sys
+    import zipfile
+
+    import spf53
+
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+
+    zip_bytes = deploy.build_lambda_zip()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        assert "spf53/lambda_handler.py" in zf.namelist()
+        extract_dir = tmp_path / "extracted"
+        zf.extractall(extract_dir)
+
+    sys.path.insert(0, str(extract_dir))
+    importlib.invalidate_caches()
+    try:
+        assert importlib.metadata.version("spf53") == spf53.__version__
+    finally:
+        sys.path.remove(str(extract_dir))
+        importlib.invalidate_caches()

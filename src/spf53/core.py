@@ -88,7 +88,10 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
     except ValueError as exc:
         return f"{dc.name}: {exc}"
 
-    live_all, live_ttls = route53.get_txt_records(dc.hosted_zone_id, dc.name)
+    try:
+        live_all, live_ttls = route53.get_txt_records(dc.hosted_zone_id, dc.name)
+    except (ClientError, BotoCoreError) as exc:
+        return f"{dc.name}: {exc}"
     live = {name: strings for name, strings in live_all.items() if name != dc.name}
     apex_warning = _apex_warning(dc.name, live_all.get(dc.name))
 
@@ -159,10 +162,18 @@ def _apex_warning(domain: str, apex_record: list[str] | None) -> str | None:
     )
 
 
+_QUALIFIERS = "+-~?"
+
+
+def _strip_qualifier(token: str) -> str:
+    return token[1:] if token and token[0] in _QUALIFIERS else token
+
+
 def _networks_from_records(records: dict[str, list[str]]) -> list[IPNetwork]:
     networks: list[IPNetwork] = []
     for name, strings in records.items():
-        for token in "".join(strings).split():
+        for raw_token in "".join(strings).split():
+            token = _strip_qualifier(raw_token)
             for prefix in ("ip4:", "ip6:"):
                 if token.startswith(prefix):
                     try:

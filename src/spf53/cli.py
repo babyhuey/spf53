@@ -6,8 +6,10 @@ import argparse
 import sys
 from collections.abc import Sequence
 
+from botocore.exceptions import BotoCoreError, ClientError
+
 from spf53 import core, ssm
-from spf53.config import Spf53Config, load_config_file
+from spf53.config import ConfigError, Spf53Config, load_config_file
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -60,6 +62,14 @@ def _load_config(args: argparse.Namespace) -> Spf53Config:
     return ssm.load_config_ssm(args.ssm_param or ssm.DEFAULT_PARAM)
 
 
+def _load_config_safe(args: argparse.Namespace, command: str) -> Spf53Config | None:
+    try:
+        return _load_config(args)
+    except (ConfigError, OSError, ClientError, BotoCoreError) as exc:
+        print(f"spf53 {command}: {exc}", file=sys.stderr)
+        return None
+
+
 def _expected_apex_line(p: core.DomainPlan) -> str | None:
     if not p.desired:
         return None
@@ -72,7 +82,9 @@ def _expected_apex_line(p: core.DomainPlan) -> str | None:
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
-    cfg = _load_config(args)
+    cfg = _load_config_safe(args, "plan")
+    if cfg is None:
+        return 1
     result = core.plan(cfg)
 
     for p in result.plans:
@@ -103,7 +115,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
 
 
 def _cmd_apply(args: argparse.Namespace) -> int:
-    cfg = _load_config(args)
+    cfg = _load_config_safe(args, "apply")
+    if cfg is None:
+        return 1
     result = core.apply(cfg, force=args.force)
 
     refused: list[str] = []

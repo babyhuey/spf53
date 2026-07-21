@@ -173,9 +173,9 @@ def test_mx_mechanism_with_host_and_prefix_len(fake_dns: FakeDNS) -> None:
 
 
 def test_a_single_slash_prefix_len_applies_only_to_ipv4(fake_dns: FakeDNS) -> None:
-    """F1 repro: a `/LEN` single-slash form is the ip4-cidr-length only (RFC 7208 5.3)
+    """A `/LEN` single-slash form is the ip4-cidr-length only (RFC 7208 5.3) —
 
-    and must not be applied to AAAA results, which should default to /128.
+    it must not be applied to AAAA results, which should default to /128.
     """
     fake_dns.txt["provider.example.com"] = ["v=spf1 a:mail.provider.com/24 ~all"]
     fake_dns.a["mail.provider.com"] = ["192.0.2.10"]

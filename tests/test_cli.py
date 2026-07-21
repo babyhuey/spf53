@@ -7,6 +7,7 @@ import argparse
 import pytest
 
 from spf53 import cli
+from spf53.config import ConfigError
 from spf53.core import DomainPlan, RunResult
 from spf53.guards import GuardResult
 
@@ -120,6 +121,38 @@ def test_apply_force_overrides_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert cli.main(["apply", "-c", "dummy.yaml", "--force"]) == 0
+
+
+def test_plan_config_load_error_prints_error_and_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_load_config(args: argparse.Namespace) -> None:
+        raise ConfigError("invalid YAML: bad indentation")
+
+    monkeypatch.setattr(cli, "_load_config", fake_load_config)
+
+    exit_code = cli.main(["plan", "-c", "dummy.yaml"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "spf53 plan:" in err
+    assert "invalid YAML" in err
+
+
+def test_apply_config_load_error_prints_error_and_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_load_config(args: argparse.Namespace) -> None:
+        raise ConfigError("invalid YAML: bad indentation")
+
+    monkeypatch.setattr(cli, "_load_config", fake_load_config)
+
+    exit_code = cli.main(["apply", "-c", "dummy.yaml"])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "spf53 apply:" in err
+    assert "invalid YAML" in err
 
 
 def test_config_and_ssm_param_are_mutually_exclusive() -> None:
