@@ -382,6 +382,47 @@ domains:
     assert cfg.domains[0].passthrough == ("a:example.com", "mx:example.com")
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["a:mail.example.com/33", "mx:example.com//129", "a:x.com/24//129", "ptr:example.com/24"],
+)
+def test_out_of_range_cidr_length_passthrough_raises_config_error(value: str) -> None:
+    """An IPv4 CIDR length must be 0-32 and an IPv6 CIDR length must be 0-128
+    -- an out-of-range length would publish a syntax error that PermErrors
+    the whole domain. ptr: has no CIDR-length suffix at all.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_in_range_cidr_length_passthrough_entries_accepted() -> None:
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "a:mail.example.com/32"
+      - "a:mail.example.com/0"
+      - "mx:example.com//128"
+      - "a:x.com/24//64"
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == (
+        "a:mail.example.com/32",
+        "a:mail.example.com/0",
+        "mx:example.com//128",
+        "a:x.com/24//64",
+    )
+
+
 @pytest.mark.parametrize("value", ["", "   "])
 def test_empty_or_whitespace_only_passthrough_raises_config_error(value: str) -> None:
     yaml_text = f"""

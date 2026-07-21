@@ -29,8 +29,10 @@ _VALID_POLICIES = ("~all", "-all")
 # simply fail to match, with no separate "bare" or "empty-target" check
 # needed. ip4:/ip6: are handled separately via match_ip_mechanism +
 # parse_ip_literal, since "a real CIDR" isn't expressible as a regex.
-_A_MX_RE = re.compile(r"^(?:a|mx):(?P<host>[^/]+)(?:/\d+)?(?://\d+)?$", re.IGNORECASE)
-_PTR_RE = re.compile(r"^ptr:(?P<host>.+)$", re.IGNORECASE)
+_A_MX_RE = re.compile(
+    r"^(?:a|mx):(?P<host>[^/]+)(?:/(?P<len4>\d+))?(?://(?P<len6>\d+))?$", re.IGNORECASE
+)
+_PTR_RE = re.compile(r"^ptr:(?P<host>[^/]+)$", re.IGNORECASE)
 _EXISTS_INCLUDE_RE = re.compile(r"^(?:exists|include):(?P<target>.+)$", re.IGNORECASE)
 # redirect= is a modifier, not a mechanism -- RFC 7208 gives it no qualifier
 # prefix -- so this is matched against the raw entry rather than the
@@ -166,12 +168,23 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
             raise ConfigError(f"{label}: {exc}") from exc
         return
 
-    if (
-        _A_MX_RE.match(stripped)
-        or _PTR_RE.match(stripped)
-        or _EXISTS_INCLUDE_RE.match(stripped)
-        or _REDIRECT_RE.match(entry)
-    ):
+    a_mx_match = _A_MX_RE.match(stripped)
+    if a_mx_match is not None:
+        len4 = a_mx_match.group("len4")
+        if len4 is not None and not (0 <= int(len4) <= 32):
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} has an invalid IPv4 CIDR "
+                f"length '/{len4}' — must be 0-32"
+            )
+        len6 = a_mx_match.group("len6")
+        if len6 is not None and not (0 <= int(len6) <= 128):
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} has an invalid IPv6 CIDR "
+                f"length '//{len6}' — must be 0-128"
+            )
+        return
+
+    if _PTR_RE.match(stripped) or _EXISTS_INCLUDE_RE.match(stripped) or _REDIRECT_RE.match(entry):
         return
 
     raise ConfigError(
