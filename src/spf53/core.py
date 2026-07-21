@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -95,7 +96,7 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
 
         try:
             live_all, live_ttls = txt_future.result()
-        except (ClientError, BotoCoreError) as exc:
+        except (ClientError, BotoCoreError, ValueError) as exc:
             return f"{dc.name}: {exc}"
 
     try:
@@ -120,7 +121,16 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
     except ValueError as exc:
         return f"{dc.name}: {exc}"
 
-    guard = guards.check_guards(live_networks, comparison_networks, dc.max_shrink_pct)
+    shrink_guard = guards.check_guards(live_networks, comparison_networks, dc.max_shrink_pct)
+    lookup_cost = chunker.lookup_cost(desired, dc.passthrough)
+    cost_guard = guards.check_lookup_cost(lookup_cost)
+    guard = GuardResult(
+        ok=shrink_guard.ok and cost_guard.ok,
+        reasons=shrink_guard.reasons + cost_guard.reasons,
+    )
+
+    live_policy = extract_policy(live)
+    desired_policy = extract_policy(desired)
 
     return DomainPlan(
         domain=dc.name,
@@ -130,9 +140,11 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
         upserts=upserts,
         deletes=deletes,
         guard=guard,
-        lookup_cost=chunker.lookup_cost(desired, dc.passthrough),
+        lookup_cost=lookup_cost,
         apex_warning=apex_warning,
-        summary=_build_summary(dc.name, live_networks, comparison_networks),
+        summary=_build_summary(
+            dc.name, live_networks, comparison_networks, live_policy, desired_policy
+        ),
         delete_ttls=delete_ttls,
     )
 
@@ -191,9 +203,13 @@ def _parse_ip_token(raw_token: str, context: str) -> IPNetwork | None:
     for prefix in ("ip4:", "ip6:"):
         if lower.startswith(prefix):
             try:
-                return ipaddress.ip_network(token[len(prefix) :], strict=False)
+                return _spf.parse_ip_literal(token[len(prefix) :], context)
             except ValueError as exc:
-                raise ValueError(f"invalid {prefix} token {token!r} in {context}: {exc}") from exc
+                # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
+                # recovers the raw ipaddress error this message is built from.
+                raise ValueError(
+                    f"invalid {prefix} token {token!r} in {context}: {exc.__cause__}"
+                ) from exc
     return None
 
 
@@ -226,19 +242,12 @@ def _passthrough_networks(passthrough: Sequence[str]) -> list[IPNetwork]:
 def _collapse(networks: Sequence[IPNetwork]) -> list[IPNetwork]:
     """Collapse to the minimal non-overlapping CIDR set covering the same addresses.
 
-    Mirrors resolver.flatten()'s own end-of-pipeline collapsing: split by
-    family (collapse_addresses requires same-version input), sort, and
-    collapse each family separately. Without this, an exact-duplicate or
-    partially-overlapping CIDR — e.g. a passthrough literal that also
-    appears in the resolver-derived network list — gets double-counted in
-    guards.check_guards' address totals, which can produce a false-positive
-    or false-negative shrink result.
+    Without this, an exact-duplicate or partially-overlapping CIDR — e.g. a
+    passthrough literal that also appears in the resolver-derived network
+    list — gets double-counted in guards.check_guards' address totals, which
+    can produce a false-positive or false-negative shrink result.
     """
-    v4 = sorted(n for n in networks if isinstance(n, ipaddress.IPv4Network))
-    v6 = sorted(n for n in networks if isinstance(n, ipaddress.IPv6Network))
-    collapsed_v4 = sorted(ipaddress.collapse_addresses(v4))
-    collapsed_v6 = sorted(ipaddress.collapse_addresses(v6))
-    return [*collapsed_v4, *collapsed_v6]
+    return _spf.collapse_networks(networks)
 
 
 def _sort_key(network: IPNetwork) -> tuple[int, int, int]:
@@ -255,20 +264,48 @@ def _format_cidrs(networks: Iterable[IPNetwork]) -> str:
     return ", ".join(shown)
 
 
+_CHUNK_NAME_RE = re.compile(r"^_spf53-(\d+)\.")
+
+
+def extract_policy(records: dict[str, list[str]]) -> str | None:
+    """Return the terminal policy token (e.g. '~all') from the
+    highest-numbered `_spf53-N.<domain>` chunk record in `records`.
+
+    Returns None if `records` contains no such chunk record, or if the
+    matching record has no content to extract a token from.
+    """
+    numbered = [
+        (int(match.group(1)), name) for name in records if (match := _CHUNK_NAME_RE.match(name))
+    ]
+    if not numbered:
+        return None
+    _, last_name = max(numbered)
+    last_strings = records.get(last_name)
+    if not last_strings:
+        return None
+    tokens = "".join(last_strings).split()
+    return tokens[-1] if tokens else None
+
+
 def _build_summary(
     domain: str,
     live_networks: Sequence[IPNetwork],
     new_networks: Sequence[IPNetwork],
+    live_policy: str | None,
+    desired_policy: str | None,
 ) -> str:
     live_set = set(live_networks)
     new_set = set(new_networks)
     added = new_set - live_set
     removed = live_set - new_set
-    return (
-        f"{domain}: {len(added)} CIDR(s) added, {len(removed)} CIDR(s) removed\n"
-        f"  added:   {_format_cidrs(added)}\n"
-        f"  removed: {_format_cidrs(removed)}"
-    )
+    lines = [
+        f"{domain}: {len(added)} CIDR(s) added, {len(removed)} CIDR(s) removed",
+        f"  added:   {_format_cidrs(added)}",
+        f"  removed: {_format_cidrs(removed)}",
+    ]
+    if live_policy is not None and desired_policy is not None and live_policy != desired_policy:
+        lines.append(f"  policy changed: {live_policy!r} -> {desired_policy!r}")
+    return "\n".join(lines)
 
 
 def _notify_refusal(topic_arn: str | None, p: DomainPlan) -> None:

@@ -243,6 +243,42 @@ def test_existing_sns_topic_arn_in_config_is_not_overwritten(tmp_path: Path) -> 
 
 
 @mock_aws
+def test_create_topic_overrides_existing_sns_topic_arn_in_config(tmp_path: Path) -> None:
+    """--create-topic must win over a pre-existing (different) sns_topic_arn:
+    the new topic is what the operator explicitly asked for, so it must be
+    the one injected into the pushed config and the one the IAM role is
+    scoped to publish to -- not silently orphaned in favor of the old ARN."""
+    old_topic_arn = "arn:aws:sns:us-east-1:123456789012:old-topic"
+    config_path = _write_config(
+        tmp_path,
+        SAMPLE_CONFIG + f"sns_topic_arn: {old_topic_arn}\n",
+    )
+    args = _make_args(config_path, create_topic="new-topic-name")
+
+    assert deploy.run_deploy(args) == 0
+
+    sns = boto3.client("sns", region_name="us-east-1")
+    topics = sns.list_topics()["Topics"]
+    assert len(topics) == 1
+    new_topic_arn = topics[0]["TopicArn"]
+    assert new_topic_arn != old_topic_arn
+    assert new_topic_arn.endswith(":new-topic-name")
+
+    pushed_text = boto3.client("ssm", region_name="us-east-1").get_parameter(Name="/spf53/config")[
+        "Parameter"
+    ]["Value"]
+    pushed_data = yaml.safe_load(pushed_text)
+    assert pushed_data["sns_topic_arn"] == new_topic_arn
+
+    iam = boto3.client("iam", region_name="us-east-1")
+    doc = iam.get_role_policy(
+        RoleName=deploy._role_name("spf53"), PolicyName=deploy._policy_name("spf53")
+    )["PolicyDocument"]
+    resources = {stmt["Sid"]: stmt["Resource"] for stmt in doc["Statement"]}
+    assert resources["SnsAlerts"] == new_topic_arn
+
+
+@mock_aws
 def test_put_config_ssm_called_with_deploy_region(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -11,6 +11,28 @@ class GuardResult:
     reasons: tuple[str, ...]  # human-readable refusal reasons, empty when ok
 
 
+MAX_LOOKUP_COST = 10  # RFC 7208 hard limit: exceeding this causes PermError for the whole domain
+LOOKUP_COST_WARN_THRESHOLD = 9  # heads-up threshold: zero headroom left, but not yet a violation
+
+
+def check_lookup_cost(lookup_cost: int) -> GuardResult:
+    """Refuse an apply whose lookup_cost exceeds the RFC 7208 hard limit.
+
+    A cost of exactly MAX_LOOKUP_COST is still valid (at capacity, zero
+    headroom) — only exceeding it is the actual RFC 7208 violation that
+    causes SPF evaluation to PermError for the whole domain.
+    """
+    if lookup_cost > MAX_LOOKUP_COST:
+        return GuardResult(
+            ok=False,
+            reasons=(
+                f"lookup cost {lookup_cost} exceeds the RFC 7208 hard limit of "
+                f"{MAX_LOOKUP_COST} — SPF evaluation would PermError for the whole domain",
+            ),
+        )
+    return GuardResult(ok=True, reasons=())
+
+
 def check_guards(
     live_networks: Sequence[IPv4Network | IPv6Network],
     new_networks: Sequence[IPv4Network | IPv6Network],

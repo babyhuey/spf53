@@ -96,9 +96,11 @@ def run_deploy(args: argparse.Namespace) -> int:
         session = boto3.Session(region_name=args.region)
 
         new_topic_arn = _ensure_sns_topic(session, args.create_topic)
-        if new_topic_arn and not cfg.sns_topic_arn:
+        if new_topic_arn:
             yaml_text = _inject_topic_arn(yaml_text, new_topic_arn)
-        topic_arn = cfg.sns_topic_arn or new_topic_arn
+            topic_arn = new_topic_arn
+        else:
+            topic_arn = cfg.sns_topic_arn
 
         put_config_ssm(yaml_text, param_name=args.param_name, region=args.region)
         print(f"pushed config to SSM parameter {args.param_name}")

@@ -694,3 +694,135 @@ def test_plan_empty_domains_returns_empty_result_without_pool() -> None:
 
     assert result.plans == ()
     assert result.errors == ()
+
+
+# --- Finding 1: malformed live TXT decoding must be isolated per-domain ----
+
+
+def test_plan_route53_malformed_txt_value_isolated_to_its_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare ValueError from decoding a live TXT record (e.g.
+    chunker.from_route53_value choking on a hand-authored, non-spf53 apex
+    record) must be isolated to that one domain — not propagate out of
+    _plan_one_domain and crash the whole plan()/apply() run for every domain.
+    """
+    bad = _domain(name="bad.example")
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+
+    def fake_get_txt_records(zone_id: str, domain: str) -> tuple[dict, dict]:
+        if domain == "bad.example":
+            raise ValueError("malformed Route53 TXT value: 'not-a-quoted-string'")
+        return {}, {}
+
+    monkeypatch.setattr(route53, "get_txt_records", fake_get_txt_records)
+
+    result = core.plan(_cfg([bad, good]))
+
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    assert len(result.plans) == 1
+    assert result.plans[0].domain == "good.example"
+
+
+# --- Finding 2: RFC 7208 hard lookup-cost limit must refuse an apply -------
+
+
+def test_plan_lookup_cost_exactly_ten_not_refused_by_cost_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # lookup_cost = len(records) + 1 apex + dns-querying passthrough count
+    #             = 1 + 1 + 8 = 10, exactly at the RFC 7208 hard limit.
+    passthrough = tuple(f"exists:{i}.example.com" for i in range(8))
+    dc = _domain(passthrough=passthrough)
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg([dc]))
+
+    p = result.plans[0]
+    assert p.lookup_cost == 10
+    assert p.guard.ok is True
+    assert p.guard.reasons == ()
+
+
+def test_plan_lookup_cost_over_rfc7208_limit_refused_despite_no_shrink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lookup_cost of 11+ must refuse the apply with a reason naming the
+    RFC 7208 limit, even when the address set is stable (first run, no live
+    records to shrink from) -- this is a distinct refusal reason from the
+    shrink guard.
+    """
+    passthrough = tuple(f"exists:{i}.example.com" for i in range(9))
+    dc = _domain(passthrough=passthrough)
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg([dc]))
+
+    p = result.plans[0]
+    assert p.lookup_cost == 11
+    assert p.guard.ok is False
+    assert any("RFC 7208" in reason for reason in p.guard.reasons)
+
+
+# --- Finding 3: a policy-only change must show up in the summary -----------
+
+
+def test_plan_policy_change_with_identical_cidrs_reported_in_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: _build_summary was computed purely from CIDR-set diffs, so
+    tightening a domain's policy (~all -> -all) with zero IP changes still
+    performs a real Route53 upsert (the last chunk's terminal token differs)
+    but the summary claimed "0 added, 0 removed", masking the enforcement
+    change entirely.
+    """
+    old_dc = _domain(policy="~all")
+    live = chunker.build_records(old_dc.name, [NET_A], old_dc.passthrough, "~all")
+
+    dc = _domain(policy="-all")  # tightened policy, same resolved CIDRs
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: (dict(live), {}))
+
+    result = core.plan(_cfg([dc]))
+
+    assert result.errors == ()
+    p = result.plans[0]
+    assert p.has_changes is True
+    assert "0 CIDR(s) added, 0 CIDR(s) removed" in p.summary
+    assert "policy changed" in p.summary
+    assert "'~all'" in p.summary
+    assert "'-all'" in p.summary
+
+
+def test_plan_first_run_no_live_baseline_does_not_report_spurious_policy_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dc = _domain()
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg([dc]))
+
+    p = result.plans[0]
+    assert "policy changed" not in p.summary
+
+
+def test_extract_policy_returns_none_for_empty_records() -> None:
+    assert core.extract_policy({}) is None
+
+
+def test_extract_policy_picks_highest_numbered_chunk() -> None:
+    records = {
+        "_spf53-1.example.com": ["v=spf1 include:_spf53-2.example.com"],
+        "_spf53-2.example.com": ["v=spf1 ip4:192.0.2.0/24 -all"],
+    }
+    assert core.extract_policy(records) == "-all"

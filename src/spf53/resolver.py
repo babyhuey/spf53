@@ -75,11 +75,7 @@ def flatten(
         # to cancel and wait=False only skips redundant bookkeeping.
         pool.shutdown(wait=False, cancel_futures=True)
 
-    v4 = sorted(n for n in networks if isinstance(n, ipaddress.IPv4Network))
-    v6 = sorted(n for n in networks if isinstance(n, ipaddress.IPv6Network))
-    collapsed_v4 = sorted(ipaddress.collapse_addresses(v4))
-    collapsed_v6 = sorted(ipaddress.collapse_addresses(v6))
-    return [*collapsed_v4, *collapsed_v6]
+    return _spf.collapse_networks(networks)
 
 
 def _walk(
@@ -131,10 +127,12 @@ def _process_record(
             continue
         if lower.startswith("ip4:") or lower.startswith("ip6:"):
             try:
-                networks.append(ipaddress.ip_network(term[4:], strict=False))
+                networks.append(_spf.parse_ip_literal(term[4:], f"{name!r} SPF record"))
             except ValueError as exc:
+                # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
+                # recovers the raw ipaddress error this message is built from.
                 raise ResolutionError(
-                    f"invalid CIDR literal {term!r} in {name!r} SPF record: {exc}"
+                    f"invalid CIDR literal {term!r} in {name!r} SPF record: {exc.__cause__}"
                 ) from exc
             continue
         if lower.startswith("include:"):

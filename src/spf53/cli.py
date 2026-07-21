@@ -8,7 +8,7 @@ from collections.abc import Sequence
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from spf53 import core, ssm
+from spf53 import core, guards, ssm
 from spf53.config import ConfigError, Spf53Config, load_config_file
 
 
@@ -73,11 +73,9 @@ def _load_config_safe(args: argparse.Namespace, command: str) -> Spf53Config | N
 def _expected_apex_line(p: core.DomainPlan) -> str | None:
     if not p.desired:
         return None
-    last_name = f"_spf53-{len(p.desired)}.{p.domain}"
-    last_strings = p.desired.get(last_name)
-    if not last_strings:
+    policy = core.extract_policy(p.desired)
+    if policy is None:
         return None
-    policy = "".join(last_strings).split()[-1]
     return f"v=spf1 include:_spf53-1.{p.domain} {policy}"
 
 
@@ -91,7 +89,11 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         print(f"== {p.domain} ==")
         apex_line = _expected_apex_line(p)
         print(f"expected apex record: {apex_line if apex_line else 'n/a'}")
-        cost_note = " (WARNING: exceeds 9-lookup limit)" if p.lookup_cost > 9 else ""
+        cost_note = (
+            f" (WARNING: exceeds {guards.LOOKUP_COST_WARN_THRESHOLD}-lookup limit)"
+            if p.lookup_cost > guards.LOOKUP_COST_WARN_THRESHOLD
+            else ""
+        )
         print(f"lookup cost: {p.lookup_cost}{cost_note}")
         if p.apex_warning:
             print(f"WARNING: {p.apex_warning}")

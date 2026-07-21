@@ -2,7 +2,7 @@
 
 from ipaddress import IPv4Network, IPv6Network
 
-from spf53.guards import GuardResult, check_guards
+from spf53.guards import GuardResult, check_guards, check_lookup_cost
 
 
 def test_empty_new_set_refused() -> None:
@@ -106,5 +106,25 @@ def test_mixed_family_new_family_first_time_passes() -> None:
     live = [IPv4Network("203.0.113.0/24")]
     new = [IPv4Network("203.0.113.0/24"), IPv6Network("2001:db8::/32")]
     result = check_guards(live, new, max_shrink_pct=30)
+    assert result.ok is True
+    assert result.reasons == ()
+
+
+def test_lookup_cost_exactly_at_hard_limit_passes() -> None:
+    # RFC 7208: exactly 10 lookups is still valid, just at capacity.
+    result = check_lookup_cost(10)
+    assert result.ok is True
+    assert result.reasons == ()
+
+
+def test_lookup_cost_over_hard_limit_refused() -> None:
+    result = check_lookup_cost(11)
+    assert result.ok is False
+    assert result.reasons
+    assert "RFC 7208" in result.reasons[0]
+
+
+def test_lookup_cost_well_under_limit_passes() -> None:
+    result = check_lookup_cost(2)
     assert result.ok is True
     assert result.reasons == ()
