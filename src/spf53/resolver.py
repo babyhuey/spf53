@@ -11,7 +11,7 @@ import ipaddress
 import logging
 import re
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 
 import dns.exception
 import dns.rdatatype
@@ -23,6 +23,9 @@ MAX_DEPTH = 10
 
 _TIMEOUT_SECONDS = 5.0
 _TRIES = 2
+# Shared across a whole flatten() call. Tasks submitted to this pool must
+# never submit further tasks to it from within a worker thread — nested
+# submission can exhaust all workers on blocked outer tasks and deadlock.
 _MAX_WORKERS = 8
 
 _A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE)
@@ -49,8 +52,16 @@ def flatten(
     """
     networks: list[_Network] = []
     seen: set[str] = set()
-    for include in includes:
-        _walk(include, resolver_ips, seen, 1, networks)
+    pool = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+    try:
+        for include in includes:
+            _walk(include, resolver_ips, seen, 1, networks, pool)
+    finally:
+        # wait=False: on the fail-fast path (see _process_record's mx branch),
+        # a sibling exchange lookup may still be running in a worker thread.
+        # Blocking shutdown here would wait for it to finish, reintroducing
+        # the latency this fail-fast logic exists to avoid.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     v4 = sorted(n for n in networks if isinstance(n, ipaddress.IPv4Network))
     v6 = sorted(n for n in networks if isinstance(n, ipaddress.IPv6Network))
@@ -65,6 +76,7 @@ def _walk(
     seen: set[str],
     depth: int,
     networks: list[_Network],
+    pool: ThreadPoolExecutor,
 ) -> None:
     if depth > MAX_DEPTH:
         raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
@@ -75,7 +87,7 @@ def _walk(
     seen.add(key)
 
     record = _get_spf_record(name, resolver_ips)
-    _process_record(name, record, resolver_ips, seen, depth, networks)
+    _process_record(name, record, resolver_ips, seen, depth, networks, pool)
 
 
 def _get_spf_record(name: str, resolver_ips: Sequence[str]) -> str:
@@ -96,6 +108,7 @@ def _process_record(
     seen: set[str],
     depth: int,
     networks: list[_Network],
+    pool: ThreadPoolExecutor,
 ) -> None:
     for raw_term in record.split()[1:]:  # [0] is "v=spf1"
         term = _strip_qualifier(raw_term)
@@ -112,10 +125,10 @@ def _process_record(
                 ) from exc
             continue
         if lower.startswith("include:"):
-            _walk(term[8:], resolver_ips, seen, depth + 1, networks)
+            _walk(term[8:], resolver_ips, seen, depth + 1, networks, pool)
             continue
         if lower.startswith("redirect="):
-            _walk(term[9:], resolver_ips, seen, depth + 1, networks)
+            _walk(term[9:], resolver_ips, seen, depth + 1, networks, pool)
             continue
         if lower.startswith("exists:"):
             logger.warning("ignoring exists mechanism in %s SPF record: %s", name, term)
@@ -129,7 +142,7 @@ def _process_record(
             host = a_match.group("host") or name
             v4_len = _parse_len(a_match.group("len4"))
             v6_len = _parse_len(a_match.group("len6"))
-            addresses = _resolve_addresses(host, resolver_ips, name)
+            addresses = _resolve_addresses(host, resolver_ips, name, pool)
             networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
             continue
 
@@ -139,19 +152,37 @@ def _process_record(
             v4_len = _parse_len(mx_match.group("len4"))
             v6_len = _parse_len(mx_match.group("len6"))
             exchanges = _call_seam(_query_mx, host, resolver_ips, name)
-            with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-                futures = [
-                    pool.submit(_resolve_addresses, exchange, resolver_ips, name)
-                    for exchange in exchanges
-                ]
-                for future in futures:
-                    addresses = future.result()
-                    networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
+            # Submit each exchange's A/AAAA lookups directly rather than via
+            # _resolve_addresses, so no worker ends up submitting further
+            # work back onto this same pool (see _MAX_WORKERS above).
+            per_exchange = [
+                (
+                    pool.submit(_call_seam, _query_a, exchange, resolver_ips, name),
+                    pool.submit(_call_seam, _query_aaaa, exchange, resolver_ips, name),
+                )
+                for exchange in exchanges
+            ]
+            _wait_fail_fast([future for pair in per_exchange for future in pair])
+            for a_future, aaaa_future in per_exchange:
+                addresses = a_future.result() + aaaa_future.result()
+                networks.extend(_addresses_to_networks(addresses, v4_len, v6_len, term, name))
             continue
 
         if "=" in term:
             continue  # unhandled modifier (e.g. exp=); nothing to flatten
         logger.warning("ignoring unrecognized SPF term in %s record: %s", name, term)
+
+
+def _wait_fail_fast(futures: Sequence[Future]) -> None:
+    """Wait for all futures; on the first exception, cancel not-yet-started
+    siblings and re-raise immediately rather than waiting for the rest.
+    """
+    done, not_done = wait(futures, return_when=FIRST_EXCEPTION)
+    for future in futures:
+        if future in done and future.exception() is not None:
+            for pending in not_done:
+                pending.cancel()
+            raise future.exception()
 
 
 def _strip_qualifier(term: str) -> str:
@@ -162,12 +193,13 @@ def _parse_len(len_str: str | None) -> int | None:
     return int(len_str) if len_str else None
 
 
-def _resolve_addresses(host: str, resolver_ips: Sequence[str], context: str) -> list[str]:
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        a_future = pool.submit(_call_seam, _query_a, host, resolver_ips, context)
-        aaaa_future = pool.submit(_call_seam, _query_aaaa, host, resolver_ips, context)
-        a_addrs = a_future.result()
-        aaaa_addrs = aaaa_future.result()
+def _resolve_addresses(
+    host: str, resolver_ips: Sequence[str], context: str, pool: ThreadPoolExecutor
+) -> list[str]:
+    a_future = pool.submit(_call_seam, _query_a, host, resolver_ips, context)
+    aaaa_future = pool.submit(_call_seam, _query_aaaa, host, resolver_ips, context)
+    a_addrs = a_future.result()
+    aaaa_addrs = aaaa_future.result()
     return a_addrs + aaaa_addrs
 
 

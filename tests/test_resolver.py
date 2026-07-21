@@ -6,6 +6,7 @@ import ipaddress
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import pytest
@@ -368,12 +369,7 @@ def test_multi_string_txt_concatenation_mixed_str_and_bytes() -> None:
     assert joined == "v=spf1 ip4:198.51.100.1/32 ~all"
 
 
-# --- Concurrency regression tests ------------------------------------------
-# _resolve_addresses fans A/AAAA out to a thread pool, and the MX branch fans
-# multiple exchanges out to a thread pool. These tests prove: (1) the queries
-# genuinely run in parallel, (2) results are still correct, (3) an exception
-# from any one concurrent lookup still surfaces as ResolutionError without
-# hanging, and (4) output stays deterministic regardless of completion order.
+# --- Concurrency tests ------------------------------------------------------
 
 
 def test_a_and_aaaa_queries_run_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,7 +389,10 @@ def test_a_and_aaaa_queries_run_concurrently(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(resolver, "_query_a", query_a)
     monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
 
-    addresses = resolver._resolve_addresses("host.example.com", RESOLVER_IPS, "host.example.com")
+    with ThreadPoolExecutor(max_workers=resolver._MAX_WORKERS) as pool:
+        addresses = resolver._resolve_addresses(
+            "host.example.com", RESOLVER_IPS, "host.example.com", pool
+        )
 
     assert sorted(addresses) == sorted(["198.51.100.7", "2001:db8::7"])
 
@@ -445,8 +444,11 @@ def test_exception_in_one_of_concurrent_a_aaaa_lookups_raises_resolution_error(
     monkeypatch.setattr(resolver, "_query_a", query_a)
     monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
 
-    with pytest.raises(ResolutionError, match="other.example.com"):
-        resolver._resolve_addresses("other.example.com", RESOLVER_IPS, "own.example.com")
+    with (
+        ThreadPoolExecutor(max_workers=resolver._MAX_WORKERS) as pool,
+        pytest.raises(ResolutionError, match="other.example.com"),
+    ):
+        resolver._resolve_addresses("other.example.com", RESOLVER_IPS, "own.example.com", pool)
 
 
 def test_one_of_several_concurrent_mx_exchange_lookups_raising_surfaces_resolution_error(
@@ -475,62 +477,156 @@ def test_one_of_several_concurrent_mx_exchange_lookups_raising_surfaces_resoluti
         flatten(["own.example.com"], RESOLVER_IPS)
 
 
-def test_flatten_is_deterministic_across_repeated_runs_with_concurrent_paths(
+def test_mx_exchange_results_are_collected_in_submission_order_not_completion_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same input flattened twice must produce byte-identical output, even
-    though the A/AAAA and MX-exchange resolution paths now run concurrently.
-
-    Staggered sleeps make worker threads finish in a different order than
-    they were submitted, on both runs, so this would catch a collector that
-    accidentally depended on completion order instead of submission order.
+    """Asserts the network-building step runs in submission order even when
+    staggered sleeps make the underlying per-exchange lookups finish out of
+    order — flatten()'s final output is always fully sorted, so asserting on
+    that output can't distinguish a submission-order collector from a
+    completion-order one; asserting on call order here can.
     """
-    # Spaced-out last octets/groups so no two networks are adjacent and
-    # collapse_addresses doesn't merge any of them into a wider CIDR.
     a_answers = {
-        "host-a.example.com": "203.0.113.10",
         "mail1.example.com": "198.51.100.10",
         "mail2.example.com": "198.51.100.20",
         "mail3.example.com": "198.51.100.30",
     }
-    aaaa_answers = {
-        "host-a.example.com": "2001:db8::10",
-        "mail1.example.com": "2001:db8:1::10",
-        "mail2.example.com": "2001:db8:1::20",
-        "mail3.example.com": "2001:db8:1::30",
-    }
     sleep_seconds = {
-        "host-a.example.com": 0.006,
-        "mail1.example.com": 0.012,
+        "mail1.example.com": 0.03,
         "mail2.example.com": 0.0,
-        "mail3.example.com": 0.009,
+        "mail3.example.com": 0.015,
     }
 
     def query_txt(name: str, resolver_ips: list[str]) -> list[str]:
-        return ["v=spf1 a:host-a.example.com mx:host-mx.example.com ~all"]
+        return ["v=spf1 mx ~all"]
 
     def query_mx(name: str, resolver_ips: list[str]) -> list[str]:
-        return ["mail3.example.com", "mail1.example.com", "mail2.example.com"]
+        return ["mail1.example.com", "mail2.example.com", "mail3.example.com"]
 
     def query_a(name: str, resolver_ips: list[str]) -> list[str]:
         time.sleep(sleep_seconds[name])
         return [a_answers[name]]
 
     def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
-        time.sleep(sleep_seconds[name])
-        return [aaaa_answers[name]]
+        return []
 
     monkeypatch.setattr(resolver, "_query_txt", query_txt)
     monkeypatch.setattr(resolver, "_query_mx", query_mx)
     monkeypatch.setattr(resolver, "_query_a", query_a)
     monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
 
-    first = flatten(["own.example.com"], RESOLVER_IPS)
-    second = flatten(["own.example.com"], RESOLVER_IPS)
+    call_order: list[str] = []
+    real_addresses_to_networks = resolver._addresses_to_networks
 
-    assert first == second
-    # v4 networks sorted, then v6 networks sorted (flatten()'s documented order) —
-    # the two families aren't mutually orderable, so they can't be sorted together.
-    expected_v4 = sorted(net(f"{ip}/32") for ip in a_answers.values())
-    expected_v6 = sorted(net(f"{ip}/128") for ip in aaaa_answers.values())
-    assert first == [*expected_v4, *expected_v6]
+    def spy(
+        addresses: list[str], v4_len: int | None, v6_len: int | None, term: str, name: str
+    ) -> list[resolver._Network]:
+        call_order.append(addresses[0])
+        return real_addresses_to_networks(addresses, v4_len, v6_len, term, name)
+
+    monkeypatch.setattr(resolver, "_addresses_to_networks", spy)
+
+    flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert call_order == ["198.51.100.10", "198.51.100.20", "198.51.100.30"]
+
+
+def test_mx_exchange_failure_does_not_wait_for_slow_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing exchange must surface its ResolutionError without blocking
+    on a sibling exchange that is still resolving. The slow sibling blocks on
+    an Event that this test never sets, with a 2s timeout as an upper bound;
+    if flatten() waited for it, this test would take close to 2s instead of
+    returning almost immediately.
+    """
+    slow_may_proceed = threading.Event()
+
+    def query_txt(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["v=spf1 mx ~all"]
+
+    def query_mx(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["fast.example.com", "slow.example.com"]
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        if name == "fast.example.com":
+            raise DNSFailure("boom")
+        slow_may_proceed.wait(timeout=2)
+        return ["198.51.100.1"]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        return []
+
+    monkeypatch.setattr(resolver, "_query_txt", query_txt)
+    monkeypatch.setattr(resolver, "_query_mx", query_mx)
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    start = time.monotonic()
+    with pytest.raises(ResolutionError, match="fast.example.com"):
+        flatten(["own.example.com"], RESOLVER_IPS)
+    elapsed = time.monotonic() - start
+
+    slow_may_proceed.set()  # release the still-running background lookup
+    assert elapsed < 0.5
+
+
+def test_single_shared_threadpool_executor_per_flatten_call(
+    monkeypatch: pytest.MonkeyPatch, fake_dns: FakeDNS
+) -> None:
+    """A flatten() call with multiple mx exchanges and an a mechanism must
+    construct exactly one ThreadPoolExecutor, not one per mx exchange or one
+    per a/mx term.
+    """
+    fake_dns.txt["own.example.com"] = ["v=spf1 mx a:other.example.com ~all"]
+    fake_dns.mx["own.example.com"] = ["mail1.example.com", "mail2.example.com"]
+    fake_dns.a["mail1.example.com"] = ["198.51.100.10"]
+    fake_dns.a["mail2.example.com"] = ["198.51.100.20"]
+    fake_dns.a["other.example.com"] = ["203.0.113.5"]
+
+    construct_count = 0
+    real_executor_cls = resolver.ThreadPoolExecutor
+
+    class CountingExecutor(real_executor_cls):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            nonlocal construct_count
+            construct_count += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(resolver, "ThreadPoolExecutor", CountingExecutor)
+
+    flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert construct_count == 1
+
+
+def test_mx_term_with_more_exchanges_than_max_workers_does_not_deadlock(
+    fake_dns: FakeDNS,
+) -> None:
+    """An mx term with >= _MAX_WORKERS exchanges must not deadlock. If a
+    worker thread ever submitted further work back onto this same bounded
+    pool, enough concurrently-blocked outer tasks could consume every
+    worker with none left free to run the inner submissions. Run flatten()
+    on a background thread and assert it finishes well inside a timeout,
+    since a real deadlock would otherwise hang the whole test run.
+    """
+    exchange_count = resolver._MAX_WORKERS + 4
+    exchanges = [f"mail{i}.example.com" for i in range(exchange_count)]
+    fake_dns.txt["own.example.com"] = ["v=spf1 mx ~all"]
+    fake_dns.mx["own.example.com"] = exchanges
+    for i, exchange in enumerate(exchanges):
+        # Spaced-out last octets so no two /32s are adjacent and collapsed
+        # by ipaddress.collapse_addresses into fewer, wider CIDRs.
+        fake_dns.a[exchange] = [f"198.51.100.{i * 10}"]
+
+    result: list[resolver._Network] = []
+
+    def run() -> None:
+        result.extend(flatten(["own.example.com"], RESOLVER_IPS))
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive(), "flatten() deadlocked with many mx exchanges"
+    assert len(result) == exchange_count
