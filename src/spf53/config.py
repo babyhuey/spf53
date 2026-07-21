@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,12 @@ _ALLOWED_DOMAIN_KEYS = {
     "max_shrink_pct",
 }
 _VALID_POLICIES = ("~all", "-all")
+
+# Matches a bare (host-less) a/mx mechanism: "a", "mx", optionally followed by
+# a "/<v4-len>" and/or "//<v6-len>" dual-cidr suffix, but with no ":<host>" --
+# a colon anywhere makes the whole string not match, since there's no ":" in
+# this pattern at all.
+_BARE_A_MX_RE = re.compile(r"^(a|mx)(/\d+)?(//\d+)?$", re.IGNORECASE)
 
 
 class ConfigError(Exception):
@@ -103,6 +110,15 @@ def _check_duplicate_domains(domains: Sequence[DomainConfig]) -> None:
         seen[d.name] = i
 
 
+def _is_bare_a_mx_ptr(term: str) -> bool:
+    """Whether `term` is a host-less a/mx/ptr mechanism (no explicit
+    ":target"), which implicitly refers to "the domain this record is
+    evaluated in" per RFC 7208 -- as opposed to e.g. "a:somehost.example",
+    which explicitly names a target and carries no such ambiguity.
+    """
+    return term.lower() == "ptr" or bool(_BARE_A_MX_RE.match(term))
+
+
 def _parse_domain(index: int, raw: object) -> DomainConfig:
     label = f"domains[{index}]"
     if not isinstance(raw, dict):
@@ -146,6 +162,8 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
     ):
         raise ConfigError(f"{label}: 'passthrough' must be a list of strings")
     for entry in passthrough_raw:
+        if not entry.strip():
+            raise ConfigError(f"{label}: passthrough entry is empty or whitespace-only")
         if any(ch.isspace() for ch in entry):
             raise ConfigError(
                 f"{label}: passthrough entry {entry!r} contains whitespace — "
@@ -158,6 +176,14 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
                 "passthrough is placed first in chunk 1, so this would terminate SPF "
                 "evaluation immediately and make every mechanism after it (including "
                 "the chunk chain and the final policy) unreachable"
+            )
+        if _is_bare_a_mx_ptr(strip_qualifier(entry)):
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} is a bare 'a'/'mx'/'ptr' "
+                "mechanism with no explicit target — a bare a/mx/ptr mechanism "
+                "implicitly refers to the domain it's evaluated in, but passthrough "
+                f"entries are spliced into '_spf53-1.{name}', not '{name}' itself — "
+                f"write it explicitly instead, e.g. 'a:{name}' or 'mx:{name}'"
             )
     passthrough = tuple(passthrough_raw)
 

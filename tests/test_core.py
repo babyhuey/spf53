@@ -214,6 +214,27 @@ def test_plan_resolution_error_does_not_block_other_domains(
     assert result.plans[0].domain == "good.example"
 
 
+def test_plan_flatten_resolution_error_is_prefixed_with_domain_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every other per-domain error path in _plan_one_domain prefixes its
+    return value with the domain name (f"{dc.name}: {exc}"); the
+    flatten()-failure catch site must match, so a multi-domain config's
+    error says which configured domain failed, not just which include.
+    """
+    dc = _domain(name="bad.example", includes=("broken.include",))
+
+    def fake_flatten(includes: tuple[str, ...], ips: tuple[str, ...]) -> list:
+        raise ResolutionError("no SPF record found for 'broken.include'")
+
+    monkeypatch.setattr(resolver, "flatten", fake_flatten)
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg([dc]))
+
+    assert result.errors == ("bad.example: no SPF record found for 'broken.include'",)
+
+
 def test_apply_resolution_error_notifies_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
     bad = _domain(name="bad.example", includes=("broken.include",))
     good = _domain(name="good.example", includes=("_spf.google.com",))

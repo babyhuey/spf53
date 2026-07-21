@@ -92,7 +92,7 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
         try:
             networks = flatten_future.result()
         except ResolutionError as exc:
-            return str(exc)
+            return f"{dc.name}: {exc}"
 
         try:
             live_all, live_ttls = txt_future.result()

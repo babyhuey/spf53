@@ -13,7 +13,7 @@ import dns.rdatatype
 import dns.resolver
 import pytest
 
-from spf53 import resolver
+from spf53 import guards, resolver
 from spf53.resolver import MAX_DEPTH, ResolutionError, flatten
 
 RESOLVER_IPS = ["1.1.1.1", "8.8.8.8"]
@@ -925,14 +925,59 @@ def test_count_transitive_lookup_cost_accepts_redirect_as_the_passthrough_term(
 
 
 def test_count_transitive_lookup_cost_is_safe_against_cycles(fake_dns: FakeDNS) -> None:
+    """A cyclic chain (a includes b, b includes a) is never actually
+    resolvable by a real SPF evaluator: it re-evaluates the repeated include
+    on every reference (it doesn't dedup by name) and keeps recursing until
+    it exceeds the RFC 7208 10-lookup budget and PermErrors. The cost
+    short-circuit reproduces that same "recurse until the budget's blown"
+    behavior safely, without an actual infinite loop -- the exact returned
+    value doesn't matter once it's over the limit (see check_lookup_cost),
+    only that it correctly reports being over.
+    """
     fake_dns.txt["a.example.com"] = ["v=spf1 include:b.example.com ~all"]
     fake_dns.txt["b.example.com"] = ["v=spf1 include:a.example.com ~all"]
 
     cost = resolver.count_transitive_lookup_cost("include:a.example.com", RESOLVER_IPS)
 
-    # a -> b (+1) -> a already seen, so the revisit costs 1 for its own
-    # include: occurrence but recurses no further.
-    assert cost == 2
+    assert cost > guards.MAX_LOOKUP_COST
+
+
+def test_count_transitive_lookup_cost_diamond_chain_does_not_dedup_shared_include(
+    fake_dns: FakeDNS,
+) -> None:
+    """Real SPF evaluators re-evaluate a repeated include target every time
+    it's referenced -- they don't dedup by name. In a diamond chain where
+    two siblings (a, b) both independently include the same c (which has 3
+    DNS-querying mechanisms of its own), c's cost must be counted once per
+    path that reaches it, not once total: x's own 2 includes (+2), each of
+    a and b's own include:c (+1 each = +2), and c's 3 mechanisms counted
+    once per visit (3 + 3 = 6) -- 2 + 2 + 6 = 10.
+    """
+    fake_dns.txt["x.example.com"] = ["v=spf1 include:a.example.com include:b.example.com ~all"]
+    fake_dns.txt["a.example.com"] = ["v=spf1 include:c.example.com ~all"]
+    fake_dns.txt["b.example.com"] = ["v=spf1 include:c.example.com ~all"]
+    fake_dns.txt["c.example.com"] = ["v=spf1 a a a ~all"]
+
+    cost = resolver.count_transitive_lookup_cost("include:x.example.com", RESOLVER_IPS)
+
+    assert cost == 10
+
+
+def test_count_transitive_lookup_cost_skips_redirect_when_record_has_all(
+    fake_dns: FakeDNS,
+) -> None:
+    """Mirrors _process_record's pre-scan: RFC 7208 6.1 says redirect= is
+    ignored when the record already has an `all` mechanism, since `all`
+    already terminates evaluation. A record with both must not have its
+    redirect= target queried or counted -- if the skip logic were missing,
+    this would raise ResolutionError instead of returning cleanly, since
+    other.example.com has no TXT record installed below.
+    """
+    fake_dns.txt["mid.example.com"] = ["v=spf1 redirect=other.example.com -all"]
+
+    cost = resolver.count_transitive_lookup_cost("include:mid.example.com", RESOLVER_IPS)
+
+    assert cost == 0
 
 
 def test_count_transitive_lookup_cost_exactly_max_depth_succeeds(fake_dns: FakeDNS) -> None:
@@ -963,12 +1008,19 @@ def test_count_transitive_lookup_cost_rejects_non_include_redirect_term() -> Non
         resolver.count_transitive_lookup_cost("exists:foo.example.com", RESOLVER_IPS)
 
 
-def test_count_transitive_lookup_cost_exceeding_max_chain_names_raises(fake_dns: FakeDNS) -> None:
-    """A passthrough include's own chain fanning out into more branches than
-    _MAX_CHAIN_NAMES allows (mirrors test_chain_exceeding_max_chain_names_raises
-    for _walk) must be refused rather than issuing that many serial DNS
-    queries -- unlike flatten(), this counter has no thread pool, so each
-    query pays its own timeout serially.
+def test_count_transitive_lookup_cost_wide_fanout_bounded_by_cost_short_circuit(
+    fake_dns: FakeDNS,
+) -> None:
+    """A passthrough include's own chain fanning out into more sibling
+    branches than _MAX_CHAIN_NAMES (mirrors
+    test_chain_exceeding_max_chain_names_raises for _walk) used to be
+    bounded only by _MAX_CHAIN_NAMES itself, allowing up to that many real,
+    serial DNS queries before refusing. Since every sibling include:
+    occurrence now counts toward cost even without dedup, the cost
+    short-circuit trips after only ~MAX_LOOKUP_COST siblings -- long before
+    _MAX_CHAIN_NAMES is ever approached -- so only a handful of the many
+    leaves are actually queried, even though the returned cost keeps
+    growing (every occurrence still counts) past the RFC 7208 limit.
     """
     leaf_count = resolver._MAX_CHAIN_NAMES + 5
     leaves = [f"leaf{i}.example.com" for i in range(leaf_count)]
@@ -978,8 +1030,12 @@ def test_count_transitive_lookup_cost_exceeding_max_chain_names_raises(fake_dns:
     for leaf in leaves:
         fake_dns.txt[leaf] = ["v=spf1 ~all"]
 
-    with pytest.raises(ResolutionError, match="SPF chain too large"):
-        resolver.count_transitive_lookup_cost("include:root.example.com", RESOLVER_IPS)
+    cost = resolver.count_transitive_lookup_cost("include:root.example.com", RESOLVER_IPS)
+
+    assert cost > guards.MAX_LOOKUP_COST
+    # 1 (root) + a handful of leaves actually queried before the cost
+    # short-circuit stopped further recursion -- nowhere near leaf_count.
+    assert len(fake_dns.seen_resolver_ips) < 20
 
 
 # --- Fix 3: NXDOMAIN on an a:/mx: target must not hard-fail the domain -----

@@ -349,6 +349,53 @@ domains:
     assert "whitespace" in str(exc_info.value)
 
 
+@pytest.mark.parametrize("value", ["a", "mx", "ptr", "a/24", "mx//64"])
+def test_bare_a_mx_ptr_passthrough_raises_config_error(value: str) -> None:
+    """A bare a/mx/ptr mechanism implicitly refers to the domain it's
+    evaluated in -- but passthrough entries are spliced into
+    '_spf53-1.<domain>', not the real domain, so a bare entry would silently
+    stop matching anything a user expects it to.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert value in str(exc_info.value)
+
+
+def test_explicit_target_a_mx_passthrough_entries_accepted() -> None:
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "a:example.com"
+      - "mx:example.com"
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == ("a:example.com", "mx:example.com")
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_empty_or_whitespace_only_passthrough_raises_config_error(value: str) -> None:
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert "empty" in str(exc_info.value) or "whitespace" in str(exc_info.value)
+
+
 def test_non_all_passthrough_entries_accepted() -> None:
     yaml_text = """
 domains:

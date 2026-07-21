@@ -17,7 +17,7 @@ import dns.exception
 import dns.rdatatype
 import dns.resolver
 
-from spf53 import _spf
+from spf53 import _spf, guards
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ def _process_record(
     # RFC 7208 6.1: redirect= is only used when the record has no `all`
     # mechanism; if `all` is present it already terminates evaluation, so
     # redirect= must be ignored below rather than followed.
-    has_all = any(_spf.strip_qualifier(t).lower() == "all" for t in raw_terms)
+    has_all = _has_all_mechanism(raw_terms)
 
     for raw_term in raw_terms:
         qualifier = _spf.get_qualifier(raw_term)
@@ -236,6 +236,19 @@ def _process_record(
         logger.warning("ignoring unrecognized SPF term in %s record: %s", name, term)
 
 
+def _has_all_mechanism(raw_terms: Sequence[str]) -> bool:
+    """Whether a record's raw term list (post "v=spf1") contains an `all`
+    mechanism.
+
+    RFC 7208 6.1: redirect= is only used when the record has no `all`
+    mechanism -- `all` already terminates evaluation, so redirect= must be
+    ignored rather than followed when both are present. Shared by
+    `_process_record` (the flattening walk) and `_count_dns_querying_mechanisms`
+    (the cost-counting walk) so both apply this pre-scan identically.
+    """
+    return any(_spf.strip_qualifier(t).lower() == "all" for t in raw_terms)
+
+
 def _require_default_qualifier(qualifier: str, raw_term: str, name: str) -> None:
     """Refuse to flatten a mechanism qualified anything but '+' (the default).
 
@@ -278,14 +291,25 @@ def count_transitive_lookup_cost(term: str, resolver_ips: Sequence[str]) -> int:
 
     Fetches the target's SPF TXT record and counts each DNS-querying
     mechanism/modifier it contains: 1 each for a/mx/ptr/exists, and 1 each
-    for a nested include:/redirect= (which is then recursed into the same
-    way `_walk` recurses for flattening). Only fetches TXT records -- RFC
-    7208 lookup cost counts mechanism/modifier occurrences, not resolved
-    A/AAAA/MX addresses -- so unlike flatten() this needs no address
-    resolution and no thread pool.
+    for a nested include:/redirect= (which is then recursed into). Only
+    fetches TXT records -- RFC 7208 lookup cost counts mechanism/modifier
+    occurrences, not resolved A/AAAA/MX addresses -- so unlike flatten() this
+    needs no address resolution and no thread pool.
+
+    Deliberately does NOT dedup by name the way `_walk` does for flattening:
+    real SPF evaluators re-evaluate a repeated include target every time
+    it's referenced, so a name reached via two different passthrough
+    branches (or a cycle) counts every time, not once. What IS memoized is
+    the DNS fetch itself -- each unique name's SPF record is looked up at
+    most once and its text reused on every revisit, so a hostile or cyclic
+    chain can't multiply real DNS queries just because the counting logic
+    revisits the same name many times.
 
     Raises ResolutionError naming the failing name on any DNS failure, or if
-    the chain depth exceeds MAX_DEPTH, mirroring flatten()'s own guards.
+    the chain depth exceeds MAX_DEPTH on a name whose record hasn't been
+    fetched yet, mirroring flatten()'s own guards -- a revisit of an
+    already-fetched name is exempt from the depth check, since it costs no
+    further DNS query; it's bounded by the cost short-circuit below instead.
     """
     stripped = _spf.strip_qualifier(term)
     lower = stripped.lower()
@@ -296,34 +320,59 @@ def count_transitive_lookup_cost(term: str, resolver_ips: Sequence[str]) -> int:
     else:
         raise ValueError(f"not an include:/redirect= term: {term!r}")
 
-    seen: set[str] = set()
-    return _count_dns_querying_mechanisms(target, resolver_ips, seen, 1)
+    cache: dict[str, str] = {}
+    return _count_dns_querying_mechanisms(target, resolver_ips, cache, 1, 0)
 
 
 def _count_dns_querying_mechanisms(
-    name: str, resolver_ips: Sequence[str], seen: set[str], depth: int
+    name: str,
+    resolver_ips: Sequence[str],
+    cache: dict[str, str],
+    depth: int,
+    running_total: int,
 ) -> int:
-    key = name.lower()
-    if key in seen:
-        return 0
-    if depth > MAX_DEPTH:
-        raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
-    if len(seen) >= _MAX_CHAIN_NAMES:
-        raise ResolutionError(
-            f"SPF chain too large: exceeded {_MAX_CHAIN_NAMES} unique names "
-            f"while resolving {name!r}"
-        )
-    seen.add(key)
+    """Return the DNS-querying-mechanism cost of `name`'s own record plus
+    everything transitively reachable through its include:/redirect= chain.
 
-    record = _get_spf_record(name, resolver_ips)
+    `running_total` is the cost already accumulated by the caller before
+    this call -- everything counted so far along the whole walk, not just
+    this branch -- mirroring how a real evaluator keeps a single running
+    total across the whole evaluation rather than a per-branch one. Once
+    `running_total` plus this call's own accumulated cost would exceed
+    `guards.MAX_LOOKUP_COST`, recursion into further include:/redirect=
+    targets stops (their own occurrence still counts -- a real evaluator
+    tallies the lookup before it PermErrors -- but nothing beneath them is
+    queried or counted). This is what actually bounds a cyclic chain: it
+    keeps "recursing" (revisiting cached names) exactly like a real
+    evaluator would, until the shared budget runs out, rather than looping
+    forever.
+    """
+    key = name.lower()
+    record = cache.get(key)
+    if record is None:
+        if depth > MAX_DEPTH:
+            raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
+        if len(cache) >= _MAX_CHAIN_NAMES:
+            raise ResolutionError(
+                f"SPF chain too large: exceeded {_MAX_CHAIN_NAMES} unique names "
+                f"while resolving {name!r}"
+            )
+        record = _get_spf_record(name, resolver_ips)
+        cache[key] = record
+
+    raw_terms = record.split()[1:]  # [0] is "v=spf1"
+    has_all = _has_all_mechanism(raw_terms)
+
     cost = 0
-    for raw_term in record.split()[1:]:  # [0] is "v=spf1"
+    for raw_term in raw_terms:
         term = _spf.strip_qualifier(raw_term)
         lower = term.lower()
         if lower.startswith("include:"):
-            cost += 1 + _count_dns_querying_mechanisms(term[8:], resolver_ips, seen, depth + 1)
+            nested = term[8:]
         elif lower.startswith("redirect="):
-            cost += 1 + _count_dns_querying_mechanisms(term[9:], resolver_ips, seen, depth + 1)
+            if has_all:
+                continue
+            nested = term[9:]
         elif (
             _A_TERM_RE.match(term)
             or _MX_TERM_RE.match(term)
@@ -332,6 +381,16 @@ def _count_dns_querying_mechanisms(
             or lower.startswith("exists:")
         ):
             cost += 1
+            continue
+        else:
+            continue
+
+        cost += 1
+        if running_total + cost <= guards.MAX_LOOKUP_COST:
+            cost += _count_dns_querying_mechanisms(
+                nested, resolver_ips, cache, depth + 1, running_total + cost
+            )
+
     return cost
 
 
