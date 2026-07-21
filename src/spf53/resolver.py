@@ -39,9 +39,18 @@ _MAX_CHAIN_NAMES = 200
 
 _QUALIFIER_NAMES = {"-": "fail", "~": "softfail", "?": "neutral"}
 
-_A_TERM_RE = re.compile(r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE)
+# len4/len6 are capped at 3 digits (RFC 7208's valid range is 0-128, so no
+# legitimate length is longer) to keep int() from ever seeing an absurdly
+# long digit string from a hostile/malformed remote SPF record -- Python
+# 3.11+ raises a bare ValueError past 4300 digits, which _parse_len doesn't
+# expect and which would otherwise escape as an unhandled exception rather
+# than the ResolutionError this module raises for every other malformed
+# remote input.
+_A_TERM_RE = re.compile(
+    r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d{1,3}))?(//(?P<len6>\d{1,3}))?$", re.IGNORECASE
+)
 _MX_TERM_RE = re.compile(
-    r"^mx(:(?P<host>[^/]+))?(/(?P<len4>\d+))?(//(?P<len6>\d+))?$", re.IGNORECASE
+    r"^mx(:(?P<host>[^/]+))?(/(?P<len4>\d{1,3}))?(//(?P<len6>\d{1,3}))?$", re.IGNORECASE
 )
 
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network

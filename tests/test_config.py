@@ -468,6 +468,55 @@ domains:
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a:host.example.com/2٤",  # Arabic-Indic digit 4 -- int() reads it as 24
+        "a:h.com/2۴",  # Extended Arabic-Indic digit 4
+        "a:h.com/3２",  # Fullwidth digit 2 -- int() reads it as 32
+        "mx:host.example.com//12８",  # Fullwidth digit 8 -- int() reads it as 128
+        "a:héllo.example.com",  # non-ASCII target, not just a non-ASCII length
+        "include:_spf.exämple.com",
+        "exists:☃.example.com",
+    ],
+)
+def test_non_ascii_passthrough_entry_raises_config_error(value: str) -> None:
+    """RFC 7208 only allows ASCII. Unicode decimal digits (which \\d matches
+    and int() converts) could otherwise sail through a CIDR-length bounds
+    check that assumes ASCII input -- e.g. '/2٤' parses as int 24 and
+    passes a 0-32 range check, then publishes non-ASCII bytes as a CIDR
+    length. A single ASCII check up front closes this and the equivalent
+    non-ASCII-target gap at once.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_oversized_cidr_length_passthrough_raises_config_error() -> None:
+    """A CIDR length longer than any valid value (max 3 digits, since 128 is
+    the largest legal length) must be rejected by the shape match itself,
+    not reach int() -- Python 3.11+ raises a bare ValueError, not
+    ConfigError, past 4300 digits of int-string conversion.
+    """
+    value = "a:host.example.com/" + "1" * 4301
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
 @pytest.mark.parametrize("value", ["", "   "])
 def test_empty_or_whitespace_only_passthrough_raises_config_error(value: str) -> None:
     yaml_text = f"""

@@ -30,7 +30,7 @@ _VALID_POLICIES = ("~all", "-all")
 # needed. ip4:/ip6: are handled separately via match_ip_mechanism +
 # parse_ip_literal, since "a real CIDR" isn't expressible as a regex.
 _A_MX_RE = re.compile(
-    r"^(?:a|mx):(?P<host>[^/]+)(?:/(?P<len4>0|[1-9]\d*))?(?://(?P<len6>0|[1-9]\d*))?$",
+    r"^(?:a|mx):(?P<host>[^/]+)(?:/(?P<len4>0|[1-9][0-9]{0,2}))?(?://(?P<len6>0|[1-9][0-9]{0,2}))?$",
     re.IGNORECASE,
 )
 _PTR_RE = re.compile(r"^ptr:(?P<host>[^/]+)$", re.IGNORECASE)
@@ -140,6 +140,15 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
     as an ignored modifier). A positive match list has no such gap: anything
     not on it is rejected by default.
     """
+    if not entry.isascii():
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} contains non-ASCII characters — "
+            "RFC 7208 only allows ASCII in an SPF record, so this would publish "
+            "invalid syntax (this also covers Unicode digits in a CIDR length, "
+            "e.g. '/2٤', which Python's int() would otherwise silently accept "
+            "as a valid-looking '24')"
+        )
+
     stripped = strip_qualifier(entry)
 
     if stripped.lower() == "all":

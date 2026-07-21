@@ -157,6 +157,24 @@ def test_a_mechanism_with_host_and_prefix_len(fake_dns: FakeDNS) -> None:
     assert result == [net("203.0.113.16/28")]
 
 
+def test_a_mechanism_with_absurdly_long_prefix_len_does_not_raise_bare_valueerror(
+    fake_dns: FakeDNS,
+) -> None:
+    """A malformed remote record with a 4301-digit CIDR length would make
+    int() raise a bare ValueError past Python's 4300-digit conversion
+    limit -- the regex caps the length at 3 digits so a term this malformed
+    simply fails to match and is treated like any other unrecognized
+    mechanism (skipped with a warning), never reaching int() at all.
+    """
+    fake_dns.txt["own.example.com"] = [
+        f"v=spf1 ip4:198.51.100.0/24 a:host.example.com/{'1' * 4301} ~all"
+    ]
+
+    result = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert result == [net("198.51.100.0/24")]
+
+
 def test_a_mechanism_with_host_no_len_and_ipv6(fake_dns: FakeDNS) -> None:
     fake_dns.txt["own.example.com"] = ["v=spf1 a:other.example.com ~all"]
     fake_dns.a["other.example.com"] = ["203.0.113.16"]
