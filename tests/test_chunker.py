@@ -140,8 +140,8 @@ def test_lookup_cost_counts_chain_apex_and_dns_querying_passthrough() -> None:
     ]
     records = chunker.build_records(DOMAIN, networks, passthrough, "~all")
     cost = chunker.lookup_cost(records, passthrough)
-    # chain length + 1 apex + 5 dns-querying passthrough entries
-    assert cost == len(records) + 1 + 5
+    # chain length (already includes the apex include) + 5 dns-querying passthrough entries
+    assert cost == len(records) + 5
 
 
 def test_lookup_cost_excludes_all_and_negated_all_from_passthrough() -> None:
@@ -149,7 +149,7 @@ def test_lookup_cost_excludes_all_and_negated_all_from_passthrough() -> None:
     passthrough = ["all", "-all"]
     records = chunker.build_records(DOMAIN, [], passthrough, "~all")
     cost = chunker.lookup_cost(records, passthrough)
-    assert cost == len(records) + 1
+    assert cost == len(records)
 
 
 def test_lookup_cost_counts_qualified_dns_querying_mechanisms() -> None:
@@ -167,7 +167,7 @@ def test_lookup_cost_counts_qualified_dns_querying_mechanisms() -> None:
     ]
     records = chunker.build_records(DOMAIN, [], passthrough, "~all")
     cost = chunker.lookup_cost(records, passthrough)
-    assert cost == len(records) + 1 + len(passthrough)
+    assert cost == len(records) + len(passthrough)
 
 
 def test_is_dns_querying_mechanism_rejects_all_and_negated_all() -> None:

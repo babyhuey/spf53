@@ -32,6 +32,20 @@ def collapse_networks(networks: Sequence[_Network]) -> list[_Network]:
     return [*collapsed_v4, *collapsed_v6]
 
 
+def match_ip_mechanism(term: str) -> str | None:
+    """Strip a qualifier and check if `term` is an ip4:/ip6: mechanism.
+
+    Returns the bare CIDR portion (e.g. "203.0.113.0/24") if `term` matches,
+    or None if it's not an ip4:/ip6: mechanism at all.
+    """
+    token = strip_qualifier(term)
+    lower = token.lower()
+    for prefix in ("ip4:", "ip6:"):
+        if lower.startswith(prefix):
+            return token[len(prefix) :]
+    return None
+
+
 def parse_ip_literal(cidr: str, context: str) -> _Network:
     """Parse a bare CIDR string (without any ip4:/ip6: prefix) into a network.
 

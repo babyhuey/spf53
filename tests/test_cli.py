@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pytest
 
@@ -153,6 +154,32 @@ def test_apply_config_load_error_prints_error_and_returns_1(
     assert exit_code == 1
     assert "spf53 apply:" in err
     assert "invalid YAML" in err
+
+
+def test_plan_config_load_invalid_utf8_prints_error_and_returns_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_config = tmp_path / "bad.yaml"
+    bad_config.write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
+
+    exit_code = cli.main(["plan", "-c", str(bad_config)])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "spf53 plan:" in err
+
+
+def test_apply_config_load_invalid_utf8_prints_error_and_returns_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_config = tmp_path / "bad.yaml"
+    bad_config.write_bytes(b"\xff\xfe invalid utf-8 \x80\x81")
+
+    exit_code = cli.main(["apply", "-c", str(bad_config)])
+    err = capsys.readouterr().err
+
+    assert exit_code == 1
+    assert "spf53 apply:" in err
 
 
 def test_config_and_ssm_param_are_mutually_exclusive() -> None:

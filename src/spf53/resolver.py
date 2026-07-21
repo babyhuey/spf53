@@ -125,9 +125,10 @@ def _process_record(
 
         if lower == "all":
             continue
-        if lower.startswith("ip4:") or lower.startswith("ip6:"):
+        cidr = _spf.match_ip_mechanism(term)
+        if cidr is not None:
             try:
-                networks.append(_spf.parse_ip_literal(term[4:], f"{name!r} SPF record"))
+                networks.append(_spf.parse_ip_literal(cidr, f"{name!r} SPF record"))
             except ValueError as exc:
                 # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
                 # recovers the raw ipaddress error this message is built from.

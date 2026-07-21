@@ -154,26 +154,46 @@ def apply(cfg: Spf53Config, force: bool = False) -> RunResult:
     errors = list(result.errors)
     failed_domains: list[str] = []
 
-    for p in result.plans:
-        if not p.has_changes:
-            continue
-        if not p.guard.ok and not force:
-            _notify_refusal(cfg.sns_topic_arn, p)
-            continue
-        try:
-            route53.apply_changes(p.zone_id, p.upserts, p.deletes, delete_ttls=p.delete_ttls)
-        except (ClientError, BotoCoreError) as exc:
-            msg = f"{p.domain}: failed to apply Route53 changes: {exc}"
-            errors.append(msg)
-            failed_domains.append(p.domain)
-            notify.publish(cfg.sns_topic_arn, f"spf53: failed to apply changes for {p.domain}", msg)
-            continue
-        _notify_success(cfg.sns_topic_arn, p)
+    if result.plans:
+        # Submit in result.plans order and collect via .result() over that
+        # same list (not as_completed()) so errors/failed_domains land in
+        # result.plans order regardless of which domain's thread finishes
+        # first -- mirrors plan()'s pool.submit/.result() pattern above.
+        with ThreadPoolExecutor(max_workers=min(_MAX_DOMAIN_WORKERS, len(result.plans))) as pool:
+            futures = [pool.submit(_apply_one_domain, p, cfg, force) for p in result.plans]
+            for future in futures:
+                outcome = future.result()
+                if outcome is not None:
+                    domain, msg = outcome
+                    errors.append(msg)
+                    failed_domains.append(domain)
 
     for err in result.errors:
         notify.publish(cfg.sns_topic_arn, "spf53: SPF resolution failed", err)
 
     return RunResult(plans=result.plans, errors=tuple(errors), failed_domains=tuple(failed_domains))
+
+
+def _apply_one_domain(p: DomainPlan, cfg: Spf53Config, force: bool) -> tuple[str, str] | None:
+    """Apply one domain's Route53 changes and notify, in isolation from other domains.
+
+    Returns None on skip/refusal/success, or (p.domain, error message) on a
+    Route53 apply failure -- never raises, so one domain's failure can't
+    affect any other domain's concurrent apply.
+    """
+    if not p.has_changes:
+        return None
+    if not p.guard.ok and not force:
+        _notify_refusal(cfg.sns_topic_arn, p)
+        return None
+    try:
+        route53.apply_changes(p.zone_id, p.upserts, p.deletes, delete_ttls=p.delete_ttls)
+    except (ClientError, BotoCoreError) as exc:
+        msg = f"{p.domain}: failed to apply Route53 changes: {exc}"
+        notify.publish(cfg.sns_topic_arn, f"spf53: failed to apply changes for {p.domain}", msg)
+        return (p.domain, msg)
+    _notify_success(cfg.sns_topic_arn, p)
+    return None
 
 
 def _apex_warning(domain: str, apex_record: list[str] | None) -> str | None:
@@ -199,18 +219,19 @@ def _parse_ip_token(raw_token: str, context: str) -> IPNetwork | None:
     contribute nothing to the caller's list.
     """
     token = _spf.strip_qualifier(raw_token)
-    lower = token.lower()
-    for prefix in ("ip4:", "ip6:"):
-        if lower.startswith(prefix):
-            try:
-                return _spf.parse_ip_literal(token[len(prefix) :], context)
-            except ValueError as exc:
-                # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
-                # recovers the raw ipaddress error this message is built from.
-                raise ValueError(
-                    f"invalid {prefix} token {token!r} in {context}: {exc.__cause__}"
-                ) from exc
-    return None
+    cidr = _spf.match_ip_mechanism(token)
+    if cidr is None:
+        return None
+    # match_ip_mechanism only matches "ip4:"/"ip6:" (both 4 chars), so the
+    # consumed prefix is always token's first 4 chars, lowercased to match
+    # this module's existing (lowercase-only) error message convention.
+    prefix = token[:4].lower()
+    try:
+        return _spf.parse_ip_literal(cidr, context)
+    except ValueError as exc:
+        # exc is _spf.parse_ip_literal's own wrapped ValueError; __cause__
+        # recovers the raw ipaddress error this message is built from.
+        raise ValueError(f"invalid {prefix} token {token!r} in {context}: {exc.__cause__}") from exc
 
 
 def _networks_from_records(records: dict[str, list[str]]) -> list[IPNetwork]:

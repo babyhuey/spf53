@@ -65,7 +65,7 @@ def _load_config(args: argparse.Namespace) -> Spf53Config:
 def _load_config_safe(args: argparse.Namespace, command: str) -> Spf53Config | None:
     try:
         return _load_config(args)
-    except (ConfigError, OSError, ClientError, BotoCoreError) as exc:
+    except (ConfigError, OSError, ValueError, ClientError, BotoCoreError) as exc:
         print(f"spf53 {command}: {exc}", file=sys.stderr)
         return None
 

@@ -61,9 +61,18 @@ def build_records(
 
 
 def lookup_cost(records: dict[str, list[str]], passthrough: Sequence[str]) -> int:
-    """Chain length + 1 (apex include) + DNS-querying passthrough mechanisms."""
+    """Total include-chain lookups (apex through the last chunk) + DNS-querying
+    passthrough mechanisms.
+
+    `records` has one entry per chunk (`_spf53-1.<domain>` through
+    `_spf53-N.<domain>`), so `len(records) == N`. The include chain is: apex
+    -> chunk 1 (1 lookup), then chunk 1 -> chunk 2 -> ... -> chunk N (N-1
+    more lookups) -- that's exactly N lookups total, so `len(records)` alone
+    already covers the whole chain including the apex's own include. Do NOT
+    add a separate "+1 for the apex" on top of this; that double-counts it.
+    """
     dns_querying = sum(1 for p in passthrough if _is_dns_querying_mechanism(p))
-    return len(records) + 1 + dns_querying
+    return len(records) + dns_querying
 
 
 def to_route53_value(strings: list[str]) -> str:

@@ -467,7 +467,11 @@ def test_apply_route53_client_error_recorded_and_next_domain_continues(
 
     def fake_apply_changes(zone_id: str, upserts: dict, deletes: dict, **kw: object) -> None:
         apply_calls.append((zone_id, upserts, deletes))
-        if len(apply_calls) == 1:
+        # Keyed off which domain's own upserts this call carries (not call
+        # count) so the failure lands on bad.example deterministically even
+        # though apply() now runs both domains concurrently -- thread
+        # scheduling doesn't guarantee bad.example's call happens first.
+        if any("bad.example" in name for name in upserts):
             raise ClientError(
                 {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}},
                 "ChangeResourceRecordSets",
@@ -479,7 +483,7 @@ def test_apply_route53_client_error_recorded_and_next_domain_continues(
 
     result = core.apply(_cfg([bad, good], sns_topic_arn="arn:aws:sns:us-east-1:1:spf53"))
 
-    assert len(apply_calls) == 2  # both domains attempted despite the first failing
+    assert len(apply_calls) == 2  # both domains attempted despite bad.example failing
     assert len(result.errors) == 1
     assert "bad.example" in result.errors[0]
     subjects = [c[0][1] for c in notify_calls]
@@ -505,7 +509,11 @@ def test_apply_botocore_connection_error_isolated_to_one_domain(
 
     def fake_apply_changes(zone_id: str, upserts: dict, deletes: dict, **kw: object) -> None:
         apply_calls.append((zone_id, upserts, deletes))
-        if len(apply_calls) == 1:
+        # Keyed off which domain's own upserts this call carries (not call
+        # count) so the failure lands on bad.example deterministically even
+        # though apply() now runs both domains concurrently -- thread
+        # scheduling doesn't guarantee bad.example's call happens first.
+        if any("bad.example" in name for name in upserts):
             raise EndpointConnectionError(endpoint_url="https://route53.amazonaws.com/")
 
     notify_calls: list[tuple] = []
@@ -660,6 +668,68 @@ def test_plan_runs_domains_concurrently(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(result.plans) == n
 
 
+def test_apply_runs_domains_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If apply() processed domains sequentially, only one thread would ever
+    reach the barrier at a time and `barrier.wait()` would time out
+    (BrokenBarrierError), failing this test.
+    """
+    n = 3
+    domains = [
+        _domain(name=f"d{i}.example", includes=(f"_spf.d{i}.example.com",)) for i in range(n)
+    ]
+    barrier = threading.Barrier(n, timeout=2)
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    def fake_apply_changes(zone_id: str, upserts: dict, deletes: dict, **kw: object) -> None:
+        barrier.wait()
+
+    monkeypatch.setattr(route53, "apply_changes", fake_apply_changes)
+    monkeypatch.setattr(notify, "publish", lambda *a, **kw: None)
+
+    result = core.apply(_cfg(domains))
+
+    assert result.errors == ()
+    assert len(result.plans) == n
+
+
+def test_apply_preserves_plan_order_in_failed_domains_despite_out_of_order_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """apply_changes()'s call order can't distinguish a submission-order
+    collector from a completion-order one on its own, so stagger sleeps such
+    that the domain submitted FIRST finishes LAST — a completion-order
+    collector would then produce failed_domains/errors in the reverse of
+    result.plans order.
+    """
+    from botocore.exceptions import ClientError
+
+    n = 4
+    domains = [
+        _domain(name=f"d{i}.example", hosted_zone_id=f"Z{i}", includes=(f"_spf.d{i}.example.com",))
+        for i in range(n)
+    ]
+    sleep_seconds = {d.hosted_zone_id: (n - i) * 0.02 for i, d in enumerate(domains)}
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    def fake_apply_changes(zone_id: str, upserts: dict, deletes: dict, **kw: object) -> None:
+        time.sleep(sleep_seconds[zone_id])
+        raise ClientError(
+            {"Error": {"Code": "Throttling", "Message": "Rate exceeded"}},
+            "ChangeResourceRecordSets",
+        )
+
+    monkeypatch.setattr(route53, "apply_changes", fake_apply_changes)
+    monkeypatch.setattr(notify, "publish", lambda *a, **kw: None)
+
+    result = core.apply(_cfg(domains))
+
+    assert result.failed_domains == tuple(d.name for d in domains)
+
+
 def test_plan_one_domain_flatten_and_get_txt_records_run_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -733,9 +803,10 @@ def test_plan_route53_malformed_txt_value_isolated_to_its_domain(
 def test_plan_lookup_cost_exactly_ten_not_refused_by_cost_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # lookup_cost = len(records) + 1 apex + dns-querying passthrough count
-    #             = 1 + 1 + 8 = 10, exactly at the RFC 7208 hard limit.
-    passthrough = tuple(f"exists:{i}.example.com" for i in range(8))
+    # lookup_cost = len(records) (already includes the apex include) +
+    #               dns-querying passthrough count = 1 + 9 = 10, exactly at
+    #               the RFC 7208 hard limit.
+    passthrough = tuple(f"exists:{i}.example.com" for i in range(9))
     dc = _domain(passthrough=passthrough)
 
     monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
@@ -757,7 +828,10 @@ def test_plan_lookup_cost_over_rfc7208_limit_refused_despite_no_shrink(
     records to shrink from) -- this is a distinct refusal reason from the
     shrink guard.
     """
-    passthrough = tuple(f"exists:{i}.example.com" for i in range(9))
+    # lookup_cost = len(records) (already includes the apex include) +
+    #               dns-querying passthrough count = 1 + 10 = 11, one over
+    #               the RFC 7208 hard limit.
+    passthrough = tuple(f"exists:{i}.example.com" for i in range(10))
     dc = _domain(passthrough=passthrough)
 
     monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
