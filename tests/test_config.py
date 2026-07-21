@@ -423,6 +423,51 @@ domains:
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ip4:203.0.113.0/024",
+        "ip6:2001:db8::/032",
+        "a:mail.example.com/032",
+        "a:mail.example.com/00",
+        "mx:example.com//0128",
+    ],
+)
+def test_leading_zero_cidr_length_passthrough_raises_config_error(value: str) -> None:
+    """RFC 7208's ABNF forbids a leading zero in a CIDR length ("0" is the
+    only valid single-digit form) -- a leading-zero length like /024 would
+    publish verbatim and PermError the whole domain at strict receivers.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_zero_cidr_length_passthrough_entries_accepted() -> None:
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "ip4:203.0.113.0/0"
+      - "a:mail.example.com/0"
+      - "mx:example.com//0"
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == (
+        "ip4:203.0.113.0/0",
+        "a:mail.example.com/0",
+        "mx:example.com//0",
+    )
+
+
 @pytest.mark.parametrize("value", ["", "   "])
 def test_empty_or_whitespace_only_passthrough_raises_config_error(value: str) -> None:
     yaml_text = f"""

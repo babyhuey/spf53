@@ -30,7 +30,8 @@ _VALID_POLICIES = ("~all", "-all")
 # needed. ip4:/ip6: are handled separately via match_ip_mechanism +
 # parse_ip_literal, since "a real CIDR" isn't expressible as a regex.
 _A_MX_RE = re.compile(
-    r"^(?:a|mx):(?P<host>[^/]+)(?:/(?P<len4>\d+))?(?://(?P<len6>\d+))?$", re.IGNORECASE
+    r"^(?:a|mx):(?P<host>[^/]+)(?:/(?P<len4>0|[1-9]\d*))?(?://(?P<len6>0|[1-9]\d*))?$",
+    re.IGNORECASE,
 )
 _PTR_RE = re.compile(r"^ptr:(?P<host>[^/]+)$", re.IGNORECASE)
 _EXISTS_INCLUDE_RE = re.compile(r"^(?:exists|include):(?P<target>.+)$", re.IGNORECASE)
@@ -161,6 +162,18 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
 
     cidr = match_ip_mechanism(entry)
     if cidr is not None:
+        # ipaddress.ip_network accepts a leading-zero prefix length (e.g.
+        # "203.0.113.0/024"), but RFC 7208's ABNF forbids it
+        # (ip4-cidr-length = "/" ("0" / %x31-39 0*1DIGIT)) -- parse_ip_literal
+        # alone won't catch this, so check the raw text explicitly.
+        if "/" in cidr:
+            prefix_len = cidr.rsplit("/", 1)[1]
+            if len(prefix_len) > 1 and prefix_len[0] == "0":
+                raise ConfigError(
+                    f"{label}: passthrough entry {entry!r} has a leading-zero "
+                    f"CIDR length '/{prefix_len}' — RFC 7208 does not allow "
+                    "leading zeros here"
+                )
         expected_version = 4 if stripped.lower().startswith("ip4:") else 6
         try:
             parse_ip_literal(cidr, f"passthrough entry {entry!r}", expected_version)
