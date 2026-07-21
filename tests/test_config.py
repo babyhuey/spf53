@@ -413,6 +413,93 @@ domains:
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a:%{d}.example.net",
+        "exists:%{d2r}._spf.example.net",
+        "include:%{D}.example.net",
+        "mx:%{d1r-}.example.net",
+    ],
+)
+def test_macro_d_passthrough_raises_config_error(value: str) -> None:
+    """%{d} expands to the domain currently being evaluated -- but
+    passthrough entries are spliced into '_spf53-1.<domain>', not the real
+    domain, so after relocation %{d} would silently expand to the chunk
+    record's own name instead of the domain the user meant, dropping the
+    intended authorization.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert "%{d" in str(exc_info.value)
+
+
+def test_macro_i_passthrough_entry_accepted() -> None:
+    """%{i} (and other non-'%{d...}' macros) derive from the SMTP connection
+    or sender address, not the evaluated domain, so they aren't relocation-
+    sensitive and must remain accepted -- this is the documented Salesforce-
+    style safe use case.
+    """
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "exists:%{i}._spf.example.net"
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == ("exists:%{i}._spf.example.net",)
+
+
+@pytest.mark.parametrize("value", ["a:", "mx:", "ptr:", "exists:", "include:", "redirect="])
+def test_empty_target_passthrough_raises_config_error(value: str) -> None:
+    """A colon/equals with nothing after it is spliced verbatim into the
+    built record, publishing syntactically invalid SPF -- real receivers
+    PermError the entire domain over this, not just skip the one mechanism.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com") as exc_info:
+        parse_config(yaml_text)
+    assert value in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a:example.com",
+        "mx:example.com",
+        "ptr:example.com",
+        "exists:%{i}._spf.example.net",
+        "include:_spf.example.net",
+        "redirect=_spf.example.net",
+    ],
+)
+def test_well_formed_target_passthrough_entries_accepted(value: str) -> None:
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == (value,)
+
+
 def test_load_config_file(tmp_path: Path) -> None:
     config_path = tmp_path / "spf53.yaml"
     config_path.write_text(MINIMAL_YAML)

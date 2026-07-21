@@ -28,6 +28,15 @@ _VALID_POLICIES = ("~all", "-all")
 # this pattern at all.
 _BARE_A_MX_RE = re.compile(r"^(a|mx)(/\d+)?(//\d+)?$", re.IGNORECASE)
 
+# Matches a/mx/ptr/exists/include: or redirect= with an empty (or
+# whitespace-only) target after the colon/equals, e.g. "a:" or "include: ".
+_EMPTY_TARGET_RE = re.compile(r"^(a|mx|ptr|exists|include):\s*$|^redirect=\s*$", re.IGNORECASE)
+
+# Matches any %{d...} macro reference (%{d}, %{d1}, %{d2r}, %{D}, ...) --
+# the macro letter is 'd'/'D' (case-insensitive), optionally followed by
+# transformer digits/flags, closed by '}'.
+_MACRO_D_RE = re.compile(r"%\{[dD][^}]*\}")
+
 
 class ConfigError(Exception):
     """Raised when a config fails validation."""
@@ -119,6 +128,15 @@ def _is_bare_a_mx_ptr(term: str) -> bool:
     return term.lower() == "ptr" or bool(_BARE_A_MX_RE.match(term))
 
 
+def _has_empty_target(term: str) -> bool:
+    """Whether `term` is a a:/mx:/ptr:/exists:/include:/redirect= mechanism
+    whose target (the part after the colon/equals) is empty or
+    whitespace-only, e.g. "a:" -- as opposed to "a:example.com", which names
+    a real target and is unambiguous.
+    """
+    return bool(_EMPTY_TARGET_RE.match(term))
+
+
 def _parse_domain(index: int, raw: object) -> DomainConfig:
     label = f"domains[{index}]"
     if not isinstance(raw, dict):
@@ -184,6 +202,22 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
                 "implicitly refers to the domain it's evaluated in, but passthrough "
                 f"entries are spliced into '_spf53-1.{name}', not '{name}' itself — "
                 f"write it explicitly instead, e.g. 'a:{name}' or 'mx:{name}'"
+            )
+        if _has_empty_target(strip_qualifier(entry)):
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} has an empty target — "
+                "spliced verbatim into the built record, this would publish "
+                "syntactically invalid SPF, which causes receivers to PermError "
+                "the entire domain rather than just skip this one mechanism"
+            )
+        if _MACRO_D_RE.search(entry):
+            raise ConfigError(
+                f"{label}: passthrough entry {entry!r} contains a '%{{d}}' macro — "
+                "%{d} expands to the domain currently being evaluated, but "
+                f"passthrough entries are spliced into '_spf53-1.{name}', not "
+                f"'{name}' itself, so after relocation it would silently expand to "
+                "the chunk record's own name instead of the domain you meant, "
+                "dropping the intended authorization"
             )
     passthrough = tuple(passthrough_raw)
 
