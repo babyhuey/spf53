@@ -31,10 +31,6 @@ from spf53.ssm import put_config_ssm
 
 logger = logging.getLogger(__name__)
 
-ROLE_NAME = "spf53-lambda"
-POLICY_NAME = "spf53-lambda-policy"
-RULE_NAME = "spf53-schedule"
-TARGET_ID = "spf53-lambda-target"
 INVOKE_STATEMENT_ID = "spf53-schedule-permission"
 RUNTIME = "python3.13"
 HANDLER = "spf53.lambda_handler.lambda_handler"
@@ -42,6 +38,40 @@ MEMORY_MB = 256
 TIMEOUT_S = 60
 CREATE_RETRY_ATTEMPTS = 6
 CREATE_RETRY_DELAY_S = 5
+
+
+def _sized_name(name: str, limit: int, resource: str) -> str:
+    """Guard against a --function-name that pushes a derived AWS resource
+    name past its length limit. Kept as a plain length check rather than
+    truncating/hashing since function_name is user-supplied and expected to
+    be a reasonable identifier."""
+    if len(name) > limit:
+        raise ValueError(
+            f"--function-name produces {resource} name {name!r} ({len(name)} chars), "
+            f"which exceeds the {limit}-char AWS limit"
+        )
+    return name
+
+
+def _role_name(function_name: str) -> str:
+    # Suffix matches the historical hardcoded ROLE_NAME ("spf53-lambda") so
+    # the default function name "spf53" keeps deploying the same role.
+    return _sized_name(f"{function_name}-lambda", 64, "IAM role")
+
+
+def _policy_name(function_name: str) -> str:
+    # Suffix matches the historical hardcoded POLICY_NAME.
+    return _sized_name(f"{function_name}-lambda-policy", 128, "IAM inline policy")
+
+
+def _rule_name(function_name: str) -> str:
+    # Suffix matches the historical hardcoded RULE_NAME.
+    return _sized_name(f"{function_name}-schedule", 64, "EventBridge rule")
+
+
+def _target_id(function_name: str) -> str:
+    # Suffix matches the historical hardcoded TARGET_ID.
+    return _sized_name(f"{function_name}-lambda-target", 64, "EventBridge target")
 
 
 def run_deploy(args: argparse.Namespace) -> int:
@@ -100,13 +130,15 @@ def _print_plan(args: argparse.Namespace, cfg: Spf53Config) -> None:
         print("  - no SNS topic configured; alerts disabled")
     print(f"  - push validated config to SSM parameter {args.param_name}")
     zone_ids = sorted({d.hosted_zone_id for d in cfg.domains})
-    print(f"  - create/update IAM role {ROLE_NAME} scoped to zone(s): {', '.join(zone_ids)}")
+    role_name = _role_name(args.function_name)
+    print(f"  - create/update IAM role {role_name} scoped to zone(s): {', '.join(zone_ids)}")
     print(
         f"  - build deployment package (dnspython, pyyaml, spf53) "
         f"and create/update Lambda {args.function_name}"
     )
+    rule_name = _rule_name(args.function_name)
     print(
-        f"  - create/update EventBridge rule {RULE_NAME} ({args.schedule}) -> {args.function_name}"
+        f"  - create/update EventBridge rule {rule_name} ({args.schedule}) -> {args.function_name}"
     )
 
 
@@ -186,23 +218,25 @@ def _ensure_iam_role(
     region: str,
     function_name: str,
 ) -> str:
+    role_name = _role_name(function_name)
+    policy_name = _policy_name(function_name)
     iam = session.client("iam")
     trust_doc = json.dumps(_trust_policy())
     try:
-        role_arn = iam.create_role(RoleName=ROLE_NAME, AssumeRolePolicyDocument=trust_doc)["Role"][
+        role_arn = iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=trust_doc)["Role"][
             "Arn"
         ]
-        print(f"created IAM role {ROLE_NAME}")
+        print(f"created IAM role {role_name}")
     except iam.exceptions.EntityAlreadyExistsException:
-        iam.update_assume_role_policy(RoleName=ROLE_NAME, PolicyDocument=trust_doc)
-        role_arn = iam.get_role(RoleName=ROLE_NAME)["Role"]["Arn"]
-        print(f"IAM role {ROLE_NAME} already exists, trust policy refreshed")
+        iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=trust_doc)
+        role_arn = iam.get_role(RoleName=role_name)["Role"]["Arn"]
+        print(f"IAM role {role_name} already exists, trust policy refreshed")
 
     policy_doc = json.dumps(
         _inline_policy(cfg, param_name, topic_arn, account_id, region, function_name)
     )
-    iam.put_role_policy(RoleName=ROLE_NAME, PolicyName=POLICY_NAME, PolicyDocument=policy_doc)
-    print(f"applied inline policy {POLICY_NAME}")
+    iam.put_role_policy(RoleName=role_name, PolicyName=policy_name, PolicyDocument=policy_doc)
+    print(f"applied inline policy {policy_name}")
     return role_arn
 
 
@@ -319,12 +353,14 @@ def _ensure_lambda_function(
 def _ensure_schedule(
     session: boto3.Session, schedule: str, function_name: str, function_arn: str
 ) -> None:
+    rule_name = _rule_name(function_name)
+    target_id = _target_id(function_name)
     events = session.client("events")
-    rule_arn = events.put_rule(Name=RULE_NAME, ScheduleExpression=schedule, State="ENABLED")[
+    rule_arn = events.put_rule(Name=rule_name, ScheduleExpression=schedule, State="ENABLED")[
         "RuleArn"
     ]
-    events.put_targets(Rule=RULE_NAME, Targets=[{"Id": TARGET_ID, "Arn": function_arn}])
-    print(f"scheduled rule {RULE_NAME} ({schedule}) targets {function_name}")
+    events.put_targets(Rule=rule_name, Targets=[{"Id": target_id, "Arn": function_arn}])
+    print(f"scheduled rule {rule_name} ({schedule}) targets {function_name}")
 
     lam = session.client("lambda")
     try:

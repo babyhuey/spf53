@@ -6,7 +6,7 @@ import ipaddress
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import pytest
@@ -531,6 +531,82 @@ def test_mx_exchange_results_are_collected_in_submission_order_not_completion_or
     assert call_order == ["198.51.100.10", "198.51.100.20", "198.51.100.30"]
 
 
+def test_flatten_is_deterministic_across_repeated_runs_with_concurrent_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies output stability and correctness when a single record combines
+    an `a:` mechanism and a bare `mx` mechanism, each resolving both A and
+    AAAA answers under staggered timing that makes lookups finish in a
+    different relative order than they were submitted.
+
+    This does NOT prove submission-order-safety — flatten()'s final output is
+    always fully sorted, so identical output across repeated runs can't
+    distinguish a submission-order collector from a completion-order one
+    (that's what test_mx_exchange_results_are_collected_in_submission_order_
+    not_completion_order proves above, via call-order spying). What this test
+    proves is the broader "nothing races or corrupts under realistic combined
+    load" property: concurrent A/AAAA lookups for both an `a:` mechanism and
+    multiple `mx` exchanges, sharing one bounded thread pool, must not lose,
+    duplicate, or garble results no matter which lookup finishes first — and
+    must produce byte-identical output across repeated calls.
+    """
+    a_v4 = {
+        "hosta.example.com": "192.0.2.50",
+        "mail1.example.com": "198.51.100.10",
+        "mail2.example.com": "198.51.100.20",
+    }
+    a_v6 = {
+        "hosta.example.com": "2001:db8::50",
+        "mail1.example.com": "2001:db8::10",
+        "mail2.example.com": "2001:db8::20",
+    }
+    sleep_a = {
+        "hosta.example.com": 0.02,
+        "mail1.example.com": 0.005,
+        "mail2.example.com": 0.015,
+    }
+    sleep_aaaa = {
+        "hosta.example.com": 0.0,
+        "mail1.example.com": 0.02,
+        "mail2.example.com": 0.005,
+    }
+
+    def query_txt(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["v=spf1 a:hosta.example.com mx ~all"]
+
+    def query_mx(name: str, resolver_ips: list[str]) -> list[str]:
+        return ["mail1.example.com", "mail2.example.com"]
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        time.sleep(sleep_a[name])
+        return [a_v4[name]]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        time.sleep(sleep_aaaa[name])
+        return [a_v6[name]]
+
+    monkeypatch.setattr(resolver, "_query_txt", query_txt)
+    monkeypatch.setattr(resolver, "_query_mx", query_mx)
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    expected = [
+        net("192.0.2.50/32"),
+        net("198.51.100.10/32"),
+        net("198.51.100.20/32"),
+        net("2001:db8::10/128"),
+        net("2001:db8::20/128"),
+        net("2001:db8::50/128"),
+    ]
+
+    first_run = flatten(["own.example.com"], RESOLVER_IPS)
+    second_run = flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert first_run == expected
+    assert second_run == expected
+    assert first_run == second_run
+
+
 def test_mx_exchange_failure_does_not_wait_for_slow_sibling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -564,6 +640,40 @@ def test_mx_exchange_failure_does_not_wait_for_slow_sibling(
 
     start = time.monotonic()
     with pytest.raises(ResolutionError, match="fast.example.com"):
+        flatten(["own.example.com"], RESOLVER_IPS)
+    elapsed = time.monotonic() - start
+
+    slow_may_proceed.set()  # release the still-running background lookup
+    assert elapsed < 0.5
+
+
+def test_a_mechanism_aaaa_failure_does_not_wait_for_slow_sibling_a_lookup(
+    fake_dns: FakeDNS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors test_mx_exchange_failure_does_not_wait_for_slow_sibling above,
+    but for the bare `a` mechanism's own A/AAAA pair in _resolve_addresses.
+    Before this fix, _resolve_addresses called a_future.result() then
+    aaaa_future.result() strictly in that order, so a fast AAAA failure would
+    sit unreported until the slow A lookup also finished. The slow A lookup
+    blocks on an Event this test never sets, with a 2s timeout as an upper
+    bound; if flatten() waited for it, this test would take close to 2s
+    instead of returning almost immediately.
+    """
+    fake_dns.txt["own.example.com"] = ["v=spf1 a ~all"]
+    slow_may_proceed = threading.Event()
+
+    def query_a(name: str, resolver_ips: list[str]) -> list[str]:
+        slow_may_proceed.wait(timeout=2)
+        return ["198.51.100.1"]
+
+    def query_aaaa(name: str, resolver_ips: list[str]) -> list[str]:
+        raise DNSFailure("boom")
+
+    monkeypatch.setattr(resolver, "_query_a", query_a)
+    monkeypatch.setattr(resolver, "_query_aaaa", query_aaaa)
+
+    start = time.monotonic()
+    with pytest.raises(ResolutionError, match="own.example.com"):
         flatten(["own.example.com"], RESOLVER_IPS)
     elapsed = time.monotonic() - start
 
@@ -630,3 +740,38 @@ def test_mx_term_with_more_exchanges_than_max_workers_does_not_deadlock(
 
     assert not thread.is_alive(), "flatten() deadlocked with many mx exchanges"
     assert len(result) == exchange_count
+
+
+def test_no_worker_futures_remain_unjoined_after_flatten_returns_on_success(
+    monkeypatch: pytest.MonkeyPatch, fake_dns: FakeDNS
+) -> None:
+    """flatten()'s finally block shuts its pool down with wait=False,
+    cancel_futures=True. On the success path that must never abandon a
+    still-running background lookup: every future submitted to the pool is
+    expected to already be done() by the time flatten() returns, so
+    cancel_futures=True has nothing live left to cancel. Wrap the pool's
+    submit() so every future it hands out is recorded, then assert all of
+    them are done() once flatten() has returned — a future can only reach
+    done() after its worker thread has actually finished running it.
+    """
+    fake_dns.txt["own.example.com"] = ["v=spf1 mx a:other.example.com ~all"]
+    fake_dns.mx["own.example.com"] = ["mail1.example.com", "mail2.example.com"]
+    fake_dns.a["mail1.example.com"] = ["198.51.100.10"]
+    fake_dns.a["mail2.example.com"] = ["198.51.100.20"]
+    fake_dns.a["other.example.com"] = ["203.0.113.5"]
+
+    submitted: list[Future] = []
+    real_executor_cls = resolver.ThreadPoolExecutor
+
+    class RecordingExecutor(real_executor_cls):
+        def submit(self, fn: object, *args: object, **kwargs: object) -> Future:
+            future = super().submit(fn, *args, **kwargs)
+            submitted.append(future)
+            return future
+
+    monkeypatch.setattr(resolver, "ThreadPoolExecutor", RecordingExecutor)
+
+    flatten(["own.example.com"], RESOLVER_IPS)
+
+    assert submitted, "expected at least one future to have been submitted"
+    assert all(f.done() for f in submitted)

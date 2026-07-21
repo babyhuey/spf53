@@ -14,9 +14,10 @@ from ipaddress import IPv4Network, IPv6Network
 
 MAX_TXT_STRING = 255
 MAX_STRINGS_PER_RECORD = 2
-DNS_QUERYING_MECHANISMS = ("include:", "exists:", "a", "mx", "ptr")
+DNS_QUERYING_MECHANISMS = frozenset({"include", "exists", "a", "mx", "ptr"})
 
 _MAX_RECORD_CHARS = MAX_TXT_STRING * MAX_STRINGS_PER_RECORD
+_QUALIFIERS = "+-~?"
 
 
 def build_records(
@@ -60,7 +61,7 @@ def build_records(
 
 def lookup_cost(records: dict[str, list[str]], passthrough: Sequence[str]) -> int:
     """Chain length + 1 (apex include) + DNS-querying passthrough mechanisms."""
-    dns_querying = sum(1 for p in passthrough if p.startswith(DNS_QUERYING_MECHANISMS))
+    dns_querying = sum(1 for p in passthrough if _is_dns_querying_mechanism(p))
     return len(records) + 1 + dns_querying
 
 
@@ -96,6 +97,17 @@ def from_route53_value(value: str) -> list[str]:
         i += 1  # skip closing quote
         strings.append("".join(chars))
     return strings
+
+
+def _is_dns_querying_mechanism(term: str) -> bool:
+    """Whether `term` is an a/mx/ptr/include/exists mechanism (exact keyword, not a prefix)."""
+    body = term[1:] if term and term[0] in _QUALIFIERS else term
+    cut = len(body)
+    for sep in (":", "/"):
+        idx = body.find(sep)
+        if idx != -1:
+            cut = min(cut, idx)
+    return body[:cut].lower() in DNS_QUERYING_MECHANISMS
 
 
 def _render(network: IPv4Network | IPv6Network) -> str:

@@ -57,10 +57,21 @@ def flatten(
         for include in includes:
             _walk(include, resolver_ips, seen, 1, networks, pool)
     finally:
-        # wait=False: on the fail-fast path (see _process_record's mx branch),
-        # a sibling exchange lookup may still be running in a worker thread.
+        # wait=False + cancel_futures=True: on the fail-fast path (see
+        # _process_record's mx branch), a sibling exchange lookup may still
+        # be running in a worker thread when an exception propagates here.
         # Blocking shutdown here would wait for it to finish, reintroducing
         # the latency this fail-fast logic exists to avoid.
+        #
+        # On the success path this is safe: every future ever submitted to
+        # `pool` (in _resolve_addresses and the mx branch of _process_record)
+        # is joined via a direct `.result()` call or via _wait_fail_fast's
+        # `wait(..., return_when=FIRST_EXCEPTION)` — which behaves like
+        # ALL_COMPLETED when nothing raises — before _walk/_process_record
+        # return control up the call stack. So by the time this finally
+        # block runs without an active exception, no submitted future is
+        # still running or un-started; cancel_futures=True has nothing left
+        # to cancel and wait=False only skips redundant bookkeeping.
         pool.shutdown(wait=False, cancel_futures=True)
 
     v4 = sorted(n for n in networks if isinstance(n, ipaddress.IPv4Network))
@@ -198,9 +209,8 @@ def _resolve_addresses(
 ) -> list[str]:
     a_future = pool.submit(_call_seam, _query_a, host, resolver_ips, context)
     aaaa_future = pool.submit(_call_seam, _query_aaaa, host, resolver_ips, context)
-    a_addrs = a_future.result()
-    aaaa_addrs = aaaa_future.result()
-    return a_addrs + aaaa_addrs
+    _wait_fail_fast([a_future, aaaa_future])
+    return a_future.result() + aaaa_future.result()
 
 
 def _addresses_to_networks(

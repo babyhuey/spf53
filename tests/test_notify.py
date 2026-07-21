@@ -13,13 +13,6 @@ from moto import mock_aws
 from spf53 import notify
 
 
-@pytest.fixture(autouse=True)
-def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-
-
 def test_publish_noop_on_none_topic() -> None:
     with mock.patch("boto3.client") as mock_client:
         notify.publish(None, "subject", "message")

@@ -89,6 +89,29 @@ def test_apply_exit_1_on_refusal_without_force(monkeypatch: pytest.MonkeyPatch) 
     assert cli.main(["apply", "-c", "dummy.yaml"]) == 1
 
 
+def test_apply_prints_failed_not_applied_for_failed_domain(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _stub_load_config(monkeypatch)
+    p = _plan(has_upserts=True)
+    monkeypatch.setattr(
+        cli.core,
+        "apply",
+        lambda cfg, force=False: RunResult(
+            plans=(p,),
+            errors=(f"{p.domain}: failed to apply Route53 changes: boom",),
+            failed_domains=(p.domain,),
+        ),
+    )
+
+    exit_code = cli.main(["apply", "-c", "dummy.yaml"])
+    out = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert f"{p.domain}: applied" not in out
+    assert f"{p.domain}: failed" in out
+
+
 def test_apply_force_overrides_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_load_config(monkeypatch)
     refused = _plan(has_deletes=True, guard_ok=False, reasons=("new set is empty",))

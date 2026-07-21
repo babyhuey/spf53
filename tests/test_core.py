@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ipaddress
+import threading
+import time
 
 import pytest
 
@@ -314,3 +316,155 @@ def test_apply_route53_client_error_recorded_and_next_domain_continues(
     subjects = [c[0][1] for c in notify_calls]
     assert any("failed to apply" in s.lower() for s in subjects)
     assert any("applied" in s.lower() for s in subjects)
+
+
+def test_apply_botocore_connection_error_isolated_to_one_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection-level BotoCoreError (not a ClientError API response) from
+    apply_changes must be caught and isolated the same way a ClientError is.
+    """
+    from botocore.exceptions import EndpointConnectionError
+
+    bad = _domain(name="bad.example")
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    apply_calls: list[tuple] = []
+
+    def fake_apply_changes(zone_id: str, upserts: dict, deletes: dict, **kw: object) -> None:
+        apply_calls.append((zone_id, upserts, deletes))
+        if len(apply_calls) == 1:
+            raise EndpointConnectionError(endpoint_url="https://route53.amazonaws.com/")
+
+    notify_calls: list[tuple] = []
+    monkeypatch.setattr(route53, "apply_changes", fake_apply_changes)
+    monkeypatch.setattr(notify, "publish", lambda *a, **kw: notify_calls.append((a, kw)))
+
+    result = core.apply(_cfg([bad, good], sns_topic_arn="arn:aws:sns:us-east-1:1:spf53"))
+
+    assert len(apply_calls) == 2  # good.example still attempted despite bad.example's error
+    assert result.failed_domains == ("bad.example",)
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    subjects = [c[0][1] for c in notify_calls]
+    assert any("failed to apply" in s.lower() for s in subjects)
+    assert any("applied" in s.lower() for s in subjects)
+
+
+def test_plan_chunk_build_error_isolated_to_its_domain(monkeypatch: pytest.MonkeyPatch) -> None:
+    bad = _domain(name="bad.example")
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    real_build_records = chunker.build_records
+
+    def fake_build_records(
+        name: str, networks: list, passthrough: tuple, policy: str
+    ) -> dict[str, list[str]]:
+        if name == "bad.example":
+            raise ValueError(f"mechanism too large to fit in chunk '_spf53-1.{name}'")
+        return real_build_records(name, networks, passthrough, policy)
+
+    monkeypatch.setattr(chunker, "build_records", fake_build_records)
+
+    result = core.plan(_cfg([bad, good]))
+
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    assert len(result.plans) == 1
+    assert result.plans[0].domain == "good.example"
+
+
+def test_apply_chunk_build_error_notifies_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+    bad = _domain(name="bad.example")
+    good = _domain(name="good.example")
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    real_build_records = chunker.build_records
+
+    def fake_build_records(
+        name: str, networks: list, passthrough: tuple, policy: str
+    ) -> dict[str, list[str]]:
+        if name == "bad.example":
+            raise ValueError(f"mechanism too large to fit in chunk '_spf53-1.{name}'")
+        return real_build_records(name, networks, passthrough, policy)
+
+    monkeypatch.setattr(chunker, "build_records", fake_build_records)
+
+    apply_calls: list[tuple] = []
+    notify_calls: list[tuple] = []
+    monkeypatch.setattr(route53, "apply_changes", lambda *a, **kw: apply_calls.append((a, kw)))
+    monkeypatch.setattr(notify, "publish", lambda *a, **kw: notify_calls.append((a, kw)))
+
+    result = core.apply(_cfg([bad, good], sns_topic_arn="arn:aws:sns:us-east-1:1:spf53"))
+
+    assert len(apply_calls) == 1  # good.example still applied despite bad.example's chunk error
+    assert len(result.errors) == 1
+    assert "bad.example" in result.errors[0]
+    subjects = [c[0][1] for c in notify_calls]
+    assert any("resolution failed" in s.lower() for s in subjects)  # SNS fired for the run error
+    assert any("applied" in s.lower() for s in subjects)
+
+
+def test_plan_preserves_cfg_domains_order_despite_out_of_order_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """flatten()'s output order can't distinguish a submission-order collector
+    from a completion-order one on its own, so stagger sleeps such that the
+    domain submitted FIRST finishes LAST — a completion-order collector would
+    then produce plans in the reverse of cfg.domains order.
+    """
+    domains = [
+        _domain(name=f"d{i}.example", includes=(f"_spf.d{i}.example.com",)) for i in range(4)
+    ]
+    sleep_seconds = {d.includes[0]: (len(domains) - i) * 0.02 for i, d in enumerate(domains)}
+
+    def fake_flatten(includes: tuple[str, ...], ips: tuple[str, ...]) -> list:
+        time.sleep(sleep_seconds[includes[0]])
+        return [NET_A]
+
+    monkeypatch.setattr(resolver, "flatten", fake_flatten)
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg(domains))
+
+    assert result.errors == ()
+    assert [p.domain for p in result.plans] == [d.name for d in domains]
+
+
+def test_plan_runs_domains_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If domains were processed sequentially, only one thread would ever
+    reach the barrier at a time and `barrier.wait()` would time out
+    (BrokenBarrierError), failing this test.
+    """
+    n = 3
+    domains = [
+        _domain(name=f"d{i}.example", includes=(f"_spf.d{i}.example.com",)) for i in range(n)
+    ]
+    barrier = threading.Barrier(n, timeout=2)
+
+    def fake_flatten(includes: tuple[str, ...], ips: tuple[str, ...]) -> list:
+        barrier.wait()
+        return [NET_A]
+
+    monkeypatch.setattr(resolver, "flatten", fake_flatten)
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: ({}, {}))
+
+    result = core.plan(_cfg(domains))
+
+    assert result.errors == ()
+    assert len(result.plans) == n
+
+
+def test_plan_empty_domains_returns_empty_result_without_pool() -> None:
+    result = core.plan(_cfg([]))
+
+    assert result.plans == ()
+    assert result.errors == ()

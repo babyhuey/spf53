@@ -142,3 +142,50 @@ def test_lookup_cost_counts_chain_apex_and_dns_querying_passthrough() -> None:
     cost = chunker.lookup_cost(records, passthrough)
     # chain length + 1 apex + 5 dns-querying passthrough entries
     assert cost == len(records) + 1 + 5
+
+
+def test_lookup_cost_excludes_all_and_negated_all_from_passthrough() -> None:
+    # "all"/"-all" start with the letter "a" but are not the "a" mechanism.
+    passthrough = ["all", "-all"]
+    records = chunker.build_records(DOMAIN, [], passthrough, "~all")
+    cost = chunker.lookup_cost(records, passthrough)
+    assert cost == len(records) + 1
+
+
+def test_lookup_cost_counts_qualified_dns_querying_mechanisms() -> None:
+    passthrough = [
+        "a",
+        "a:host.example.com",
+        "mx",
+        "mx:host.example.com",
+        "ptr",
+        "ptr:host.example.com",
+        "include:x",
+        "exists:x",
+        "-a",
+        "~mx:host",
+    ]
+    records = chunker.build_records(DOMAIN, [], passthrough, "~all")
+    cost = chunker.lookup_cost(records, passthrough)
+    assert cost == len(records) + 1 + len(passthrough)
+
+
+def test_is_dns_querying_mechanism_rejects_all_and_negated_all() -> None:
+    assert chunker._is_dns_querying_mechanism("all") is False
+    assert chunker._is_dns_querying_mechanism("-all") is False
+
+
+def test_is_dns_querying_mechanism_accepts_real_mechanisms_with_and_without_qualifiers() -> None:
+    for term in [
+        "a",
+        "a:host.example.com",
+        "mx",
+        "mx:host.example.com",
+        "ptr",
+        "ptr:host.example.com",
+        "include:x",
+        "exists:x",
+        "-a",
+        "~mx:host",
+    ]:
+        assert chunker._is_dns_querying_mechanism(term) is True, term

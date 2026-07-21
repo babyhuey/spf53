@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import functools
 import re
+from typing import Any
 
 import boto3
 
 from spf53 import chunker
+
+
+@functools.cache
+def _client() -> Any:
+    return boto3.client("route53")
 
 
 def get_txt_records(zone_id: str, domain: str) -> tuple[dict[str, list[str]], dict[str, int]]:
@@ -20,8 +27,7 @@ def get_txt_records(zone_id: str, domain: str) -> tuple[dict[str, list[str]], di
     domain = domain.rstrip(".")
     chunk_re = re.compile(rf"^_spf53-\d+\.{re.escape(domain)}$")
 
-    client = boto3.client("route53")
-    paginator = client.get_paginator("list_resource_record_sets")
+    paginator = _client().get_paginator("list_resource_record_sets")
 
     records: dict[str, list[str]] = {}
     ttls: dict[str, int] = {}
@@ -84,8 +90,7 @@ def apply_changes(
         for name, strings in deletes.items()
     ]
 
-    client = boto3.client("route53")
-    client.change_resource_record_sets(
+    _client().change_resource_record_sets(
         HostedZoneId=zone_id,
         ChangeBatch={"Changes": changes},
     )

@@ -23,14 +23,13 @@ domains:
       - _spf.google.com
 """
 
-
-@pytest.fixture(autouse=True)
-def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_SECURITY_TOKEN", "testing")
-    monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+SAMPLE_CONFIG_B = """\
+domains:
+  - name: example.org
+    hosted_zone_id: Z456OTHER
+    includes:
+      - amazonses.com
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -97,9 +96,9 @@ def test_policy_scoped_to_config_arns(tmp_path: Path) -> None:
     assert deploy.run_deploy(args) == 0
 
     iam = boto3.client("iam", region_name="us-east-1")
-    doc = iam.get_role_policy(RoleName=deploy.ROLE_NAME, PolicyName=deploy.POLICY_NAME)[
-        "PolicyDocument"
-    ]
+    doc = iam.get_role_policy(
+        RoleName=deploy._role_name("spf53"), PolicyName=deploy._policy_name("spf53")
+    )["PolicyDocument"]
     resources = {stmt["Sid"]: stmt["Resource"] for stmt in doc["Statement"]}
 
     account_id = boto3.client("sts", region_name="us-east-1").get_caller_identity()["Account"]
@@ -112,6 +111,74 @@ def test_policy_scoped_to_config_arns(tmp_path: Path) -> None:
         resources["CloudWatchLogs"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53:*"
     )
+
+
+@mock_aws
+def test_distinct_function_names_get_independent_iam_role_policies(tmp_path: Path) -> None:
+    """A second `--function-name` deploy must not overwrite the first
+    deployment's inline IAM policy: each function name gets its own role and
+    policy name, so neither deploy's Route53/logs permissions are lost."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    config_a = _write_config(tmp_path / "a", SAMPLE_CONFIG)
+    config_b = _write_config(tmp_path / "b", SAMPLE_CONFIG_B)
+    args_a = _make_args(config_a, function_name="spf53-a", param_name="/spf53/config-a")
+    args_b = _make_args(config_b, function_name="spf53-b", param_name="/spf53/config-b")
+
+    assert deploy.run_deploy(args_a) == 0
+    assert deploy.run_deploy(args_b) == 0
+
+    iam = boto3.client("iam", region_name="us-east-1")
+    account_id = boto3.client("sts", region_name="us-east-1").get_caller_identity()["Account"]
+
+    doc_a = iam.get_role_policy(
+        RoleName=deploy._role_name("spf53-a"), PolicyName=deploy._policy_name("spf53-a")
+    )["PolicyDocument"]
+    doc_b = iam.get_role_policy(
+        RoleName=deploy._role_name("spf53-b"), PolicyName=deploy._policy_name("spf53-b")
+    )["PolicyDocument"]
+    resources_a = {stmt["Sid"]: stmt["Resource"] for stmt in doc_a["Statement"]}
+    resources_b = {stmt["Sid"]: stmt["Resource"] for stmt in doc_b["Statement"]}
+
+    assert resources_a["Route53Flatten"] == ["arn:aws:route53:::hostedzone/Z123EXAMPLE"]
+    assert (
+        resources_a["CloudWatchLogs"]
+        == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53-a:*"
+    )
+    assert resources_b["Route53Flatten"] == ["arn:aws:route53:::hostedzone/Z456OTHER"]
+    assert (
+        resources_b["CloudWatchLogs"]
+        == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53-b:*"
+    )
+    assert len(iam.list_roles()["Roles"]) == 2
+
+
+@mock_aws
+def test_distinct_function_names_get_independent_schedules(tmp_path: Path) -> None:
+    """A second `--function-name` deploy must not retarget the first
+    deployment's EventBridge rule: each function name gets its own rule and
+    target ID, so neither schedule stops invoking its own function."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    config_a = _write_config(tmp_path / "a", SAMPLE_CONFIG)
+    config_b = _write_config(tmp_path / "b", SAMPLE_CONFIG_B)
+    args_a = _make_args(config_a, function_name="spf53-a", param_name="/spf53/config-a")
+    args_b = _make_args(config_b, function_name="spf53-b", param_name="/spf53/config-b")
+
+    assert deploy.run_deploy(args_a) == 0
+    assert deploy.run_deploy(args_b) == 0
+
+    lam = boto3.client("lambda", region_name="us-east-1")
+    arn_a = lam.get_function(FunctionName="spf53-a")["Configuration"]["FunctionArn"]
+    arn_b = lam.get_function(FunctionName="spf53-b")["Configuration"]["FunctionArn"]
+
+    events = boto3.client("events", region_name="us-east-1")
+    targets_a = events.list_targets_by_rule(Rule=deploy._rule_name("spf53-a"))["Targets"]
+    targets_b = events.list_targets_by_rule(Rule=deploy._rule_name("spf53-b"))["Targets"]
+
+    assert targets_a == [{"Id": deploy._target_id("spf53-a"), "Arn": arn_a}]
+    assert targets_b == [{"Id": deploy._target_id("spf53-b"), "Arn": arn_b}]
+    assert len(events.list_rules()["Rules"]) == 2
 
 
 @mock_aws

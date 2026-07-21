@@ -14,13 +14,6 @@ from spf53 import chunker, route53
 DOMAIN = "example.com"
 
 
-@pytest.fixture(autouse=True)
-def aws_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-
-
 @pytest.fixture
 def zone_id() -> Iterator[str]:
     with mock_aws():

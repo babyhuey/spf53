@@ -113,6 +113,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         if not p.guard.ok and not args.force:
             refused.append(p.domain)
             print(f"{p.domain}: refused - {'; '.join(p.guard.reasons)}")
+        elif p.domain in result.failed_domains:
+            print(f"{p.domain}: failed")
         else:
             print(f"{p.domain}: applied")
 
