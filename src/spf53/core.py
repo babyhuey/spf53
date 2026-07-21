@@ -111,12 +111,12 @@ def _plan_one_domain(dc: DomainConfig, resolver_ips: Sequence[str]) -> DomainPla
     delete_ttls = {name: live_ttls[name] for name in deletes if name in live_ttls}
 
     try:
-        live_networks = _networks_from_records(live)
+        live_networks = _collapse(_networks_from_records(live))
     except ValueError as exc:
         return f"{dc.name}: {exc}"
 
     try:
-        comparison_networks = networks + _passthrough_networks(dc.passthrough)
+        comparison_networks = _collapse(networks + _passthrough_networks(dc.passthrough))
     except ValueError as exc:
         return f"{dc.name}: {exc}"
 
@@ -187,8 +187,9 @@ def _parse_ip_token(raw_token: str, context: str) -> IPNetwork | None:
     contribute nothing to the caller's list.
     """
     token = _spf.strip_qualifier(raw_token)
+    lower = token.lower()
     for prefix in ("ip4:", "ip6:"):
-        if token.startswith(prefix):
+        if lower.startswith(prefix):
             try:
                 return ipaddress.ip_network(token[len(prefix) :], strict=False)
             except ValueError as exc:
@@ -220,6 +221,24 @@ def _passthrough_networks(passthrough: Sequence[str]) -> list[IPNetwork]:
         if network is not None:
             networks.append(network)
     return networks
+
+
+def _collapse(networks: Sequence[IPNetwork]) -> list[IPNetwork]:
+    """Collapse to the minimal non-overlapping CIDR set covering the same addresses.
+
+    Mirrors resolver.flatten()'s own end-of-pipeline collapsing: split by
+    family (collapse_addresses requires same-version input), sort, and
+    collapse each family separately. Without this, an exact-duplicate or
+    partially-overlapping CIDR — e.g. a passthrough literal that also
+    appears in the resolver-derived network list — gets double-counted in
+    guards.check_guards' address totals, which can produce a false-positive
+    or false-negative shrink result.
+    """
+    v4 = sorted(n for n in networks if isinstance(n, ipaddress.IPv4Network))
+    v6 = sorted(n for n in networks if isinstance(n, ipaddress.IPv6Network))
+    collapsed_v4 = sorted(ipaddress.collapse_addresses(v4))
+    collapsed_v6 = sorted(ipaddress.collapse_addresses(v6))
+    return [*collapsed_v4, *collapsed_v6]
 
 
 def _sort_key(network: IPNetwork) -> tuple[int, int, int]:

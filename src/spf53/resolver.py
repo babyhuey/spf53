@@ -90,12 +90,13 @@ def _walk(
     networks: list[_Network],
     pool: ThreadPoolExecutor,
 ) -> None:
-    if depth > MAX_DEPTH:
-        raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
-
     key = name.lower()
     if key in seen:
         return
+
+    if depth > MAX_DEPTH:
+        raise ResolutionError(f"include depth exceeded {MAX_DEPTH} at {name!r}")
+
     seen.add(key)
 
     record = _get_spf_record(name, resolver_ips)

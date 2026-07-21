@@ -283,6 +283,86 @@ def test_networks_from_records_strips_spf_qualifiers() -> None:
     assert len(networks) == 3
 
 
+def test_parse_ip_token_uppercase_prefix_and_mixed_case_hex() -> None:
+    """SPF mechanism keywords are case-insensitive per RFC 7208 — an
+    uppercase IP4:/IP6: prefix (e.g. copy-pasted from vendor SPF docs, which
+    often uses uppercase) must parse the same as lowercase, and uppercase
+    IPv6 hex digits must round-trip correctly too.
+    """
+    assert core._parse_ip_token("IP4:203.0.113.0/24", "test") == ipaddress.ip_network(
+        "203.0.113.0/24"
+    )
+    assert core._parse_ip_token("IP6:2001:DB8::/32", "test") == ipaddress.ip_network(
+        "2001:db8::/32"
+    )
+
+
+def test_passthrough_networks_uppercase_prefix_is_recognized() -> None:
+    networks = core._passthrough_networks(["IP4:203.0.113.0/24"])
+
+    assert networks == [ipaddress.ip_network("203.0.113.0/24")]
+
+
+def test_networks_from_records_uppercase_prefix_is_recognized() -> None:
+    records = {"_spf53-1.example.com": ["v=spf1 IP4:203.0.113.0/24 ~all"]}
+
+    networks = core._networks_from_records(records)
+
+    assert networks == [ipaddress.ip_network("203.0.113.0/24")]
+
+
+def test_collapse_merges_passthrough_subset_of_resolved_supernet() -> None:
+    """A passthrough /25 fully contained in a resolved /24 must collapse
+    into just the /24 rather than double-counting the overlapping addresses
+    — partial overlaps need the same collapsing as exact duplicates.
+    """
+    supernet = ipaddress.ip_network("203.0.113.0/24")
+    subnet = ipaddress.ip_network("203.0.113.0/25")  # first half of supernet
+
+    collapsed = core._collapse([supernet, subnet])
+
+    assert collapsed == [supernet]
+    assert sum(n.num_addresses for n in collapsed) == supernet.num_addresses
+
+
+def test_plan_passthrough_duplicate_removed_from_resolved_side_no_false_positive_shrink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: comparison_networks = networks + _passthrough_networks(...)
+    was a plain list concatenation with no collapsing. When a passthrough
+    literal CIDR exactly duplicates a resolver-derived CIDR, both the live
+    baseline and the new comparison set counted that CIDR's addresses
+    twice. If the resolver side later drops it (e.g. a normal upstream
+    vendor SPF change) while the passthrough entry still covers it, the
+    address count appeared to shrink by the full duplicated CIDR even
+    though the domain's true SPF-covered address space hadn't changed —
+    a false-positive guard refusal.
+    """
+    stable_cidr = "198.51.100.0/24"
+    dup_cidr = "203.0.113.0/24"
+    dc = _domain(passthrough=(f"ip4:{dup_cidr}",))
+
+    # Prior apply: the vendor's SPF resolved to both blocks, and the
+    # passthrough entry for dup_cidr duplicates one of them — this is what
+    # got published and is now live.
+    resolved_before = [ipaddress.ip_network(stable_cidr), ipaddress.ip_network(dup_cidr)]
+    live = chunker.build_records(dc.name, resolved_before, dc.passthrough, dc.policy)
+
+    # Now the vendor's SPF record no longer includes dup_cidr (a normal,
+    # safe upstream change) — the passthrough entry alone still covers it.
+    resolved_after = [ipaddress.ip_network(stable_cidr)]
+
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: resolved_after)
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: (dict(live), {}))
+
+    result = core.plan(_cfg([dc]))
+
+    assert result.errors == ()
+    p = result.plans[0]
+    assert p.guard.ok is True
+    assert p.guard.reasons == ()
+
+
 def test_plan_steady_state_passthrough_cidr_matching_resolved_cidr_is_no_op(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

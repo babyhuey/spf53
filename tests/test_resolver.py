@@ -114,6 +114,20 @@ def test_depth_beyond_max_depth_raises(fake_dns: FakeDNS) -> None:
         flatten([top], RESOLVER_IPS)
 
 
+def test_revisit_of_already_seen_domain_beyond_max_depth_is_free(fake_dns: FakeDNS) -> None:
+    """A domain already resolved via a shallow include is free to revisit later,
+    even through a branch deep enough that a first visit there would exceed
+    MAX_DEPTH — the revisit costs no further lookups and must not raise.
+    """
+    chain_top = _install_chain(fake_dns, MAX_DEPTH)
+    fake_dns.txt[f"chain{MAX_DEPTH}.example.com"] = ["v=spf1 include:shared.example.com ~all"]
+    fake_dns.txt["shared.example.com"] = ["v=spf1 ip4:203.0.113.200/32 ~all"]
+
+    result = flatten(["shared.example.com", chain_top], RESOLVER_IPS)
+
+    assert result == [net("203.0.113.200/32")]
+
+
 def test_a_mechanism_bare_resolves_own_domain(fake_dns: FakeDNS) -> None:
     fake_dns.txt["own.example.com"] = ["v=spf1 a ~all"]
     fake_dns.a["own.example.com"] = ["198.51.100.7"]
