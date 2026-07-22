@@ -411,13 +411,13 @@ def test_update_path_waits_between_code_and_config_updates(
 
     calls: list[str] = []
 
-    original_wait = deploy._wait_for_update
+    original_wait = deploy._wait_for_lambda_state
 
-    def recording_wait(lam: object, function_name: str) -> None:
+    def recording_wait(lam: object, function_name: str, waiter_name: str) -> None:
         calls.append("wait")
-        original_wait(lam, function_name)
+        original_wait(lam, function_name, waiter_name)
 
-    monkeypatch.setattr(deploy, "_wait_for_update", recording_wait)
+    monkeypatch.setattr(deploy, "_wait_for_lambda_state", recording_wait)
 
     original_make_api_call = BaseClient._make_api_call
 
@@ -440,7 +440,7 @@ def test_update_path_waits_between_code_and_config_updates(
 
 
 @mock_aws
-def test_wait_for_update_swallows_waiter_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wait_for_lambda_state_swallows_waiter_error(monkeypatch: pytest.MonkeyPatch) -> None:
     from botocore.exceptions import WaiterError
 
     lam = boto3.client("lambda", region_name="us-east-1")
@@ -451,7 +451,44 @@ def test_wait_for_update_swallows_waiter_error(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(lam, "get_waiter", lambda name: ExplodingWaiter())
 
-    deploy._wait_for_update(lam, "some-function")  # must not raise
+    deploy._wait_for_lambda_state(lam, "some-function", "function_updated_v2")  # must not raise
+
+
+@mock_aws
+def test_waiter_selection_matches_create_vs_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_ensure_lambda_function must request the AWS-documented waiter for
+    each transition: function_active_v2 (polls Configuration.State; AWS's
+    own waiter description says "should be used after new function
+    creation") after _create_function, and function_updated_v2 (polls
+    Configuration.LastUpdateStatus; "should be used after function
+    updates") after update_function_code/update_function_configuration.
+    moto can't simulate the actual async race this waiter selection matters
+    for, but this locks in that the code asks AWS for the
+    contractually-correct waiter at each step, rather than relying on
+    function_updated_v2 happening to also work after a create by
+    coincidence."""
+    from botocore.client import BaseClient
+
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts")
+
+    requested: list[str] = []
+    original_get_waiter = BaseClient.get_waiter
+
+    def recording_get_waiter(self: BaseClient, waiter_name: str) -> object:
+        requested.append(waiter_name)
+        return original_get_waiter(self, waiter_name)
+
+    monkeypatch.setattr(BaseClient, "get_waiter", recording_get_waiter)
+
+    assert deploy.run_deploy(args) == 0  # create path
+    assert requested == ["function_active_v2"]
+
+    requested.clear()
+    assert deploy.run_deploy(args) == 0  # update path (function already exists)
+    assert requested == ["function_updated_v2", "function_updated_v2"]
 
 
 @mock_aws
@@ -654,3 +691,156 @@ def test_build_lambda_zip_normalizes_file_permissions_to_0o644(
         for info in zf.infolist():
             mode = stat.S_IMODE(info.external_attr >> 16)
             assert mode == 0o644, f"{info.filename} has mode {oct(mode)}, expected 0o644"
+
+
+@mock_aws
+def test_ensure_schedule_conflict_with_permission_present_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A genuine duplicate-StatementId ResourceConflictException (the
+    expected case on redeploy, once the permission is already granted) must
+    still be treated as success once the fix verifies via get_policy -- it
+    isn't enough for the new verify-before-declaring-success logic to just
+    not regress the happy path, it must actually find the statement."""
+    from botocore.client import BaseClient
+    from botocore.exceptions import ClientError
+
+    config_path = _write_config(tmp_path)
+    cfg = deploy.parse_config(config_path.read_text())
+
+    session = boto3.Session(region_name="us-east-1")
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    role_arn = deploy._ensure_iam_role(
+        session, cfg, "/spf53/config", None, account_id, "us-east-1", "spf53"
+    )
+    function_arn = deploy._ensure_lambda_function(session, "spf53", role_arn, "/spf53/config")
+    # Grants the invoke permission for real.
+    deploy._ensure_schedule(session, "rate(1 hour)", "spf53", function_arn)
+
+    original_make_api_call = BaseClient._make_api_call
+
+    def conflicting_add_permission(
+        self: BaseClient, operation_name: str, api_params: object
+    ) -> object:
+        if operation_name == "AddPermission":
+            raise ClientError(
+                {"Error": {"Code": "ResourceConflictException", "Message": "already exists"}},
+                operation_name,
+            )
+        return original_make_api_call(self, operation_name, api_params)
+
+    monkeypatch.setattr(BaseClient, "_make_api_call", conflicting_add_permission)
+
+    deploy._ensure_schedule(session, "rate(1 hour)", "spf53", function_arn)  # must not raise
+
+    out = capsys.readouterr().out
+    assert "already present" in out
+
+
+@mock_aws
+def test_ensure_schedule_conflict_without_permission_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ResourceConflictException from add_permission can also fire while
+    the function is still Pending/Updating -- in which case the permission
+    was never actually granted. The old code treated this identically to a
+    harmless duplicate and silently reported success, leaving the
+    EventBridge rule wired to a function with no invoke permission and zero
+    signal that anything is wrong. The fix must verify via get_policy and
+    re-raise instead of swallowing when the statement isn't actually
+    there -- here, no permission has ever been granted, so get_policy itself
+    raises ResourceNotFoundException (no policy exists at all yet)."""
+    from botocore.client import BaseClient
+    from botocore.exceptions import ClientError
+
+    config_path = _write_config(tmp_path)
+    cfg = deploy.parse_config(config_path.read_text())
+
+    session = boto3.Session(region_name="us-east-1")
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    role_arn = deploy._ensure_iam_role(
+        session, cfg, "/spf53/config", None, account_id, "us-east-1", "spf53"
+    )
+    function_arn = deploy._ensure_lambda_function(session, "spf53", role_arn, "/spf53/config")
+
+    original_make_api_call = BaseClient._make_api_call
+
+    def conflicting_add_permission(
+        self: BaseClient, operation_name: str, api_params: object
+    ) -> object:
+        if operation_name == "AddPermission":
+            raise ClientError(
+                {"Error": {"Code": "ResourceConflictException", "Message": "pending"}},
+                operation_name,
+            )
+        return original_make_api_call(self, operation_name, api_params)
+
+    monkeypatch.setattr(BaseClient, "_make_api_call", conflicting_add_permission)
+
+    with pytest.raises(ClientError) as exc_info:
+        deploy._ensure_schedule(session, "rate(1 hour)", "spf53", function_arn)
+    assert exc_info.value.response["Error"]["Code"] == "ResourceConflictException"
+
+
+@mock_aws
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_missing_pip_returns_early_error_before_any_aws_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dry_run: bool,
+) -> None:
+    """_pip_is_available() must be checked before the --dry-run early-return
+    and before any AWS mutation in a real run. Previously it was only
+    consulted deep inside _ensure_lambda_function, after the SSM config push
+    and IAM role/policy mutation had already happened, and was never
+    consulted at all during --dry-run, so dry-run reported success even
+    though a real run would immediately fail on this."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts", dry_run=dry_run)
+    monkeypatch.setattr(deploy, "_pip_is_available", lambda: False)
+
+    result = deploy.run_deploy(args)
+
+    assert result == 1
+    err = capsys.readouterr().err
+    assert err.strip().startswith("spf53 deploy:")
+    assert "pip" in err
+    assert "Traceback" not in err
+    assert boto3.client("iam", region_name="us-east-1").list_roles()["Roles"] == []
+    assert boto3.client("lambda", region_name="us-east-1").list_functions()["Functions"] == []
+    assert boto3.client("sns", region_name="us-east-1").list_topics()["Topics"] == []
+    assert boto3.client("ssm", region_name="us-east-1").describe_parameters()["Parameters"] == []
+    assert boto3.client("events", region_name="us-east-1").list_rules()["Rules"] == []
+
+
+@mock_aws
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("schedule", ["", "not-a-schedule", "rate 1 hour"])
+def test_malformed_schedule_returns_early_error_before_any_aws_mutation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    dry_run: bool,
+    schedule: str,
+) -> None:
+    """--schedule is otherwise never validated until the final
+    events.put_rule call, the very last AWS mutation in the whole deploy
+    sequence -- a malformed value used to fail only after SSM, IAM, and the
+    Lambda function/code had all already been created or updated, and
+    --dry-run didn't check it either. A basic rate(...)/cron(...) shape
+    check must reject it immediately instead, before any AWS mutation."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts", schedule=schedule, dry_run=dry_run)
+
+    result = deploy.run_deploy(args)
+
+    assert result == 1
+    err = capsys.readouterr().err
+    assert err.strip().startswith("spf53 deploy:")
+    assert "schedule" in err
+    assert "Traceback" not in err
+    assert boto3.client("iam", region_name="us-east-1").list_roles()["Roles"] == []
+    assert boto3.client("lambda", region_name="us-east-1").list_functions()["Functions"] == []
+    assert boto3.client("sns", region_name="us-east-1").list_topics()["Topics"] == []
+    assert boto3.client("ssm", region_name="us-east-1").describe_parameters()["Parameters"] == []
+    assert boto3.client("events", region_name="us-east-1").list_rules()["Rules"] == []

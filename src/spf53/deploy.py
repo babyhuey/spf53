@@ -58,6 +58,34 @@ def _pip_is_available() -> bool:
     return importlib.util.find_spec("pip") is not None
 
 
+def _require_pip() -> None:
+    if not _pip_is_available():
+        raise MissingPipError(
+            "no pip module found in this Python environment; spf53 deploy needs pip "
+            "to build the Lambda dependency bundle. Run it from an environment with "
+            "pip installed -- e.g. `pip install spf53` instead of `uv tool install "
+            "spf53`, or `uv tool install spf53 --with pip`."
+        )
+
+
+def _validate_schedule_expression(schedule: str) -> None:
+    """Fail fast on an obviously malformed --schedule value.
+
+    This is a basic shape check (starts with rate(/cron( and has a closing
+    paren), not a full EventBridge grammar validator -- events.put_rule
+    still does the authoritative validation. Without even this much, a
+    schedule that's missing entirely or clearly not an EventBridge
+    expression only surfaces as a failure at the very last AWS mutation in
+    the deploy sequence, after SSM, IAM, and the Lambda function/code have
+    all already been created or updated.
+    """
+    if not (schedule.startswith(("rate(", "cron(")) and schedule.endswith(")")):
+        raise ValueError(
+            f"--schedule {schedule!r} doesn't look like a valid EventBridge schedule "
+            "expression; expected rate(...) or cron(...)"
+        )
+
+
 def _sized_name(name: str, limit: int, resource: str) -> str:
     """Guard against a --function-name that pushes a derived AWS resource
     name past its length limit. Kept as a plain length check rather than
@@ -101,7 +129,9 @@ def run_deploy(args: argparse.Namespace) -> int:
         _policy_name(args.function_name)
         _rule_name(args.function_name)
         _target_id(args.function_name)
-    except (ConfigError, OSError, ValueError) as exc:
+        _validate_schedule_expression(args.schedule)
+        _require_pip()
+    except (ConfigError, OSError, ValueError, MissingPipError) as exc:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
         return 1
 
@@ -324,13 +354,7 @@ def build_lambda_zip() -> bytes:
     copied alongside so importlib.metadata.version("spf53") still resolves
     correctly at runtime inside the deployed Lambda.
     """
-    if not _pip_is_available():
-        raise MissingPipError(
-            "no pip module found in this Python environment; spf53 deploy needs pip "
-            "to build the Lambda dependency bundle. Run it from an environment with "
-            "pip installed -- e.g. `pip install spf53` instead of `uv tool install "
-            "spf53`, or `uv tool install spf53 --with pip`."
-        )
+    _require_pip()
 
     pinned_deps = [
         f"dnspython=={importlib.metadata.version('dnspython')}",
@@ -422,20 +446,29 @@ def _create_function(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _wait_for_update(lam: BaseClient, function_name: str) -> None:
-    """Wait out an in-progress Lambda update before the next mutating call.
+def _wait_for_lambda_state(lam: BaseClient, function_name: str, waiter_name: str) -> None:
+    """Wait out an in-progress Lambda state transition before the next
+    mutating call.
 
-    On real AWS, create_function/update_function_code leave the function
-    with LastUpdateStatus=InProgress for a few seconds; a mutating call made
-    during that window raises ResourceConflictException. moto applies
-    updates synchronously, so this waiter no-ops under test. If the waiter
-    itself misbehaves (missing, or never observes a terminal status), that's
-    logged and swallowed rather than failing the deploy.
+    On real AWS, create_function leaves Configuration.State=Pending, and
+    update_function_code/update_function_configuration leave
+    Configuration.LastUpdateStatus=InProgress, for a few seconds; a mutating
+    call made during either window raises ResourceConflictException. Callers
+    must pass the waiter matching what they just did: "function_active_v2"
+    (polls Configuration.State, succeeds on Active) after _create_function,
+    or "function_updated_v2" (polls Configuration.LastUpdateStatus, succeeds
+    on Successful) after an update call -- per AWS's own waiter
+    descriptions, each "should be used after" its respective operation, and
+    using the wrong one only "works" by coincidence rather than by
+    documented contract. moto applies changes synchronously, so this waiter
+    no-ops under test. If the waiter itself misbehaves (missing, or never
+    observes a terminal status), that's logged and swallowed rather than
+    failing the deploy.
     """
     try:
-        lam.get_waiter("function_updated_v2").wait(FunctionName=function_name)
+        lam.get_waiter(waiter_name).wait(FunctionName=function_name)
     except (WaiterError, ValueError, ClientError, BotoCoreError) as exc:
-        logger.info("waiter for %s did not confirm update completion: %s", function_name, exc)
+        logger.info("waiter for %s did not confirm completion: %s", function_name, exc)
 
 
 def _ensure_lambda_function(
@@ -454,7 +487,7 @@ def _ensure_lambda_function(
 
     if exists:
         lam.update_function_code(FunctionName=function_name, ZipFile=zip_bytes)
-        _wait_for_update(lam, function_name)
+        _wait_for_lambda_state(lam, function_name, "function_updated_v2")
         response = lam.update_function_configuration(
             FunctionName=function_name,
             Runtime=RUNTIME,
@@ -470,11 +503,11 @@ def _ensure_lambda_function(
         # ResourceConflictException for THAT reason, which the caller
         # currently (mis)treats as "permission already present" and silently
         # never grants it.
-        _wait_for_update(lam, function_name)
+        _wait_for_lambda_state(lam, function_name, "function_updated_v2")
         print(f"updated Lambda function {function_name}")
     else:
         response = _create_function(lam, function_name, role_arn, zip_bytes, env)
-        _wait_for_update(lam, function_name)
+        _wait_for_lambda_state(lam, function_name, "function_active_v2")
         print(f"created Lambda function {function_name}")
 
     return response["FunctionArn"]
@@ -505,4 +538,24 @@ def _ensure_schedule(
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ResourceConflictException":
             raise
+        # ResourceConflictException fires for two different reasons: a
+        # genuine duplicate StatementId (expected on redeploy, harmless) or
+        # the function still being Pending/Updating when add_permission was
+        # called, in which case the permission was never actually granted.
+        # Verify which one actually happened rather than trusting the error
+        # code's likely-but-unproven meaning -- the alternative is a
+        # schedule that's wired up but never actually invokes the function,
+        # with no signal until someone notices missed runs.
+        if not _invoke_permission_present(lam, function_name):
+            raise
         print(f"EventBridge invoke permission on {function_name} already present")
+
+
+def _invoke_permission_present(lam: BaseClient, function_name: str) -> bool:
+    try:
+        policy = json.loads(lam.get_policy(FunctionName=function_name)["Policy"])
+    except lam.exceptions.ResourceNotFoundException:
+        # No policy exists at all yet, so the permission definitely was
+        # never granted.
+        return False
+    return any(stmt.get("Sid") == INVOKE_STATEMENT_ID for stmt in policy.get("Statement", []))
