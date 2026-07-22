@@ -517,6 +517,35 @@ domains:
         parse_config(yaml_text)
 
 
+@pytest.mark.parametrize(
+    "escaped_target",
+    [
+        r"foo\x00bar.example",  # NUL
+        r"foo\x01bar.example",  # SOH
+        r"foo\x7Fbar.example",  # DEL -- isascii() doesn't exclude it either
+    ],
+)
+def test_control_char_passthrough_entry_raises_config_error(escaped_target: str) -> None:
+    """isascii() alone admits C0 control characters and DEL -- none of them
+    are in RFC 7208's visible-ASCII macro-literal grammar (%x21-24/%x26-7E),
+    and none are caught by the separate whitespace check either. A YAML
+    double-quoted escape (as used here, mirroring how a real config file
+    could carry one) decodes to a real control character that reaches
+    _validate_passthrough_shape intact -- unlike a raw control character in
+    a plain YAML scalar, which PyYAML itself already rejects before
+    validation ever runs.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["include:{escaped_target}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
 @pytest.mark.parametrize("value", ["", "   "])
 def test_empty_or_whitespace_only_passthrough_raises_config_error(value: str) -> None:
     yaml_text = f"""

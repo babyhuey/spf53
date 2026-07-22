@@ -140,13 +140,22 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
     as an ignored modifier). A positive match list has no such gap: anything
     not on it is rejected by default.
     """
-    if not entry.isascii():
+    # RFC 7208's macro-literal grammar is exactly the visible-ASCII range
+    # %x21-24 / %x26-7E (i.e. everything printable except backslash) --
+    # nothing outside 0x21-0x7e is ever legal in an SPF record. isascii()
+    # alone isn't enough: it admits C0 control characters (\x00-\x1f) and
+    # DEL (\x7f), which aren't excluded by the separate whitespace check
+    # either (isspace() only catches a handful of them) and can reach this
+    # function via a YAML double-quoted escape like "a:host\x00.example".
+    # Gating on the visible range closes that, plus every non-ASCII byte
+    # (including Unicode digits in a CIDR length, e.g. '/2٤', which
+    # Python's int() would otherwise silently accept as a valid-looking
+    # '24') in one check.
+    if not all(0x21 <= ord(ch) <= 0x7E for ch in entry):
         raise ConfigError(
-            f"{label}: passthrough entry {entry!r} contains non-ASCII characters — "
-            "RFC 7208 only allows ASCII in an SPF record, so this would publish "
-            "invalid syntax (this also covers Unicode digits in a CIDR length, "
-            "e.g. '/2٤', which Python's int() would otherwise silently accept "
-            "as a valid-looking '24')"
+            f"{label}: passthrough entry {entry!r} contains a character outside "
+            "RFC 7208's printable-ASCII SPF alphabet — this would publish invalid "
+            "syntax"
         )
 
     stripped = strip_qualifier(entry)

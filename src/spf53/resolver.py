@@ -39,18 +39,25 @@ _MAX_CHAIN_NAMES = 200
 
 _QUALIFIER_NAMES = {"-": "fail", "~": "softfail", "?": "neutral"}
 
-# len4/len6 are capped at 3 digits (RFC 7208's valid range is 0-128, so no
-# legitimate length is longer) to keep int() from ever seeing an absurdly
-# long digit string from a hostile/malformed remote SPF record -- Python
-# 3.11+ raises a bare ValueError past 4300 digits, which _parse_len doesn't
-# expect and which would otherwise escape as an unhandled exception rather
-# than the ResolutionError this module raises for every other malformed
-# remote input.
+# len4/len6 use [0-9] rather than \d -- \d matches any Unicode decimal digit
+# (e.g. Arabic-Indic '٤'), which int() silently converts, so a remote SPF
+# record could carry a CIDR length RFC 7208's ABNF (DIGIT = %x30-39, ASCII
+# only) actually forbids and a real evaluator would PermError on, while
+# spf53 quietly parsed and flattened it anyway. They're also capped at 3
+# digits (RFC 7208's valid range is 0-128, so no legitimate length is
+# longer) to keep int() from ever seeing an absurdly long digit string from
+# a hostile/malformed remote record -- Python 3.11+ raises a bare
+# ValueError past 4300 digits, which _parse_len doesn't expect and which
+# would otherwise escape as an unhandled exception rather than the
+# ResolutionError this module raises for every other malformed remote
+# input. A term that fails either check simply doesn't match and falls
+# through to the "unrecognized mechanism, skip with a warning" path used
+# for any other unparseable term.
 _A_TERM_RE = re.compile(
-    r"^a(:(?P<host>[^/]+))?(/(?P<len4>\d{1,3}))?(//(?P<len6>\d{1,3}))?$", re.IGNORECASE
+    r"^a(:(?P<host>[^/]+))?(/(?P<len4>[0-9]{1,3}))?(//(?P<len6>[0-9]{1,3}))?$", re.IGNORECASE
 )
 _MX_TERM_RE = re.compile(
-    r"^mx(:(?P<host>[^/]+))?(/(?P<len4>\d{1,3}))?(//(?P<len6>\d{1,3}))?$", re.IGNORECASE
+    r"^mx(:(?P<host>[^/]+))?(/(?P<len4>[0-9]{1,3}))?(//(?P<len6>[0-9]{1,3}))?$", re.IGNORECASE
 )
 
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network
