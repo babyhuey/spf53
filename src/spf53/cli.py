@@ -37,7 +37,14 @@ def _build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("-c", "--config", required=True, metavar="FILE")
     deploy_parser.add_argument("--schedule", default="rate(1 hour)")
     deploy_parser.add_argument("--create-topic", metavar="NAME")
-    deploy_parser.add_argument("--param-name", default=ssm.DEFAULT_PARAM)
+    deploy_parser.add_argument(
+        "--param-name",
+        default=None,
+        help=(
+            f"SSM parameter to push config to (default: {ssm.DEFAULT_PARAM} for "
+            "--function-name spf53, otherwise derived from --function-name)"
+        ),
+    )
     deploy_parser.add_argument("--function-name", default="spf53")
     deploy_parser.add_argument("--region")
     deploy_parser.add_argument("--dry-run", action="store_true")

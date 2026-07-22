@@ -29,7 +29,7 @@ from botocore.exceptions import BotoCoreError, ClientError, WaiterError
 
 import spf53
 from spf53.config import ConfigError, Spf53Config, parse_config
-from spf53.ssm import put_config_ssm
+from spf53.ssm import DEFAULT_PARAM, put_config_ssm
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,22 @@ class MissingPipError(RuntimeError):
     venv with no pip at all, so the `python -m pip install --target ...`
     call this module relies on to build the Lambda dependency bundle would
     otherwise fail with a confusing subprocess traceback.
+    """
+
+
+class PermissionVerificationError(RuntimeError):
+    """Raised when _invoke_permission_present can't tell whether the
+    EventBridge invoke permission is actually present, because get_policy
+    itself was denied.
+
+    add_permission raising ResourceConflictException is the expected,
+    common path on every redeploy (see _ensure_schedule): it fires both for
+    a harmless duplicate StatementId and for the permission never having
+    been granted, and get_policy is how those are told apart. If get_policy
+    is itself denied, that ambiguity can't be resolved at all -- this must
+    surface as a clear, actionable failure naming the missing
+    lambda:GetPolicy permission, rather than either a confusing raw
+    botocore error or (worse) silently assuming success.
     """
 
 
@@ -120,6 +136,17 @@ def _target_id(function_name: str) -> str:
     return _sized_name(f"{function_name}-lambda-target", 64, "EventBridge target")
 
 
+def _default_param_name(function_name: str) -> str:
+    # The default function name ("spf53") keeps the historical flat SSM
+    # path so existing single-deployment users see no change. Any other
+    # function name gets its own derived path instead -- without this, two
+    # independently-named deployments left at the default --param-name
+    # would silently share (and clobber) the same SSM parameter.
+    if function_name == "spf53":
+        return DEFAULT_PARAM
+    return f"/spf53/{function_name}/config"
+
+
 def run_deploy(args: argparse.Namespace) -> int:
     """Run the deploy bootstrap. Returns a process exit code."""
     try:
@@ -134,6 +161,9 @@ def run_deploy(args: argparse.Namespace) -> int:
     except (ConfigError, OSError, ValueError, MissingPipError) as exc:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
         return 1
+
+    if args.param_name is None:
+        args.param_name = _default_param_name(args.function_name)
 
     if args.dry_run:
         _print_plan(args, cfg)
@@ -175,6 +205,9 @@ def run_deploy(args: argparse.Namespace) -> int:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
         return 1
     except MissingPipError as exc:
+        print(f"spf53 deploy: {exc}", file=sys.stderr)
+        return 1
+    except PermissionVerificationError as exc:
         print(f"spf53 deploy: {exc}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as exc:
@@ -558,4 +591,13 @@ def _invoke_permission_present(lam: BaseClient, function_name: str) -> bool:
         # No policy exists at all yet, so the permission definitely was
         # never granted.
         return False
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "AccessDeniedException":
+            raise
+        raise PermissionVerificationError(
+            "spf53 deploy couldn't verify the EventBridge invoke permission on "
+            f"{function_name!r}: lambda:GetPolicy was denied. lambda:GetPolicy is "
+            "now a required deploy permission -- see the IAM permissions section "
+            "of the README -- add it to the deploy credentials and re-run."
+        ) from exc
     return any(stmt.get("Sid") == INVOKE_STATEMENT_ID for stmt in policy.get("Statement", []))

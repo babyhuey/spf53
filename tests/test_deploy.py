@@ -139,6 +139,56 @@ def test_ssm_arn_normalized_for_param_name_without_leading_slash(tmp_path: Path)
 
 
 @mock_aws
+def test_default_param_name_matches_legacy_path_for_default_function_name(tmp_path: Path) -> None:
+    """Backward compat: with --function-name left at its default ("spf53")
+    and --param-name omitted entirely, the resolved SSM parameter must still
+    be the historical flat path -- existing single-deployment users must see
+    no change in behavior."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts", param_name=None)
+
+    assert deploy.run_deploy(args) == 0
+
+    assert args.param_name == "/spf53/config"
+    params = boto3.client("ssm", region_name="us-east-1").describe_parameters()["Parameters"]
+    assert [p["Name"] for p in params] == ["/spf53/config"]
+
+
+@mock_aws
+def test_default_param_name_derived_from_non_default_function_name(tmp_path: Path) -> None:
+    """A --function-name other than the default, with --param-name omitted,
+    must get its own distinct, function-name-derived SSM path -- otherwise
+    two independently-named deployments left at the flat default would
+    silently share (and clobber) the same parameter."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(
+        config_path, create_topic="spf53-alerts", function_name="spf53-a", param_name=None
+    )
+
+    assert deploy.run_deploy(args) == 0
+
+    assert args.param_name == "/spf53/spf53-a/config"
+    params = boto3.client("ssm", region_name="us-east-1").describe_parameters()["Parameters"]
+    assert [p["Name"] for p in params] == ["/spf53/spf53-a/config"]
+
+
+@mock_aws
+def test_dry_run_prints_resolved_param_name_not_stale_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--dry-run's printed plan must reflect the actual function-name-derived
+    param name that a real run would use, not the flat default -- otherwise
+    the plan lies about which SSM parameter is about to be written."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, function_name="spf53-a", param_name=None, dry_run=True)
+
+    assert deploy.run_deploy(args) == 0
+
+    out = capsys.readouterr().out
+    assert "/spf53/spf53-a/config" in out
+
+
+@mock_aws
 def test_distinct_function_names_get_independent_iam_role_policies(tmp_path: Path) -> None:
     """A second `--function-name` deploy must not overwrite the first
     deployment's inline IAM policy: each function name gets its own role and
@@ -780,6 +830,57 @@ def test_ensure_schedule_conflict_without_permission_reraises(
     with pytest.raises(ClientError) as exc_info:
         deploy._ensure_schedule(session, "rate(1 hour)", "spf53", function_arn)
     assert exc_info.value.response["Error"]["Code"] == "ResourceConflictException"
+
+
+@mock_aws
+def test_ensure_schedule_conflict_get_policy_access_denied_raises_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the deploy credentials lack lambda:GetPolicy, the verification
+    call added to tell a harmless duplicate-StatementId
+    ResourceConflictException apart from a genuinely missing permission can
+    itself be denied. That must surface as a clear, actionable
+    PermissionVerificationError naming lambda:GetPolicy, not a raw/confusing
+    botocore AccessDeniedException, and not be silently treated as
+    verification success."""
+    from botocore.client import BaseClient
+    from botocore.exceptions import ClientError
+
+    config_path = _write_config(tmp_path)
+    cfg = deploy.parse_config(config_path.read_text())
+
+    session = boto3.Session(region_name="us-east-1")
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    role_arn = deploy._ensure_iam_role(
+        session, cfg, "/spf53/config", None, account_id, "us-east-1", "spf53"
+    )
+    function_arn = deploy._ensure_lambda_function(session, "spf53", role_arn, "/spf53/config")
+    deploy._ensure_schedule(session, "rate(1 hour)", "spf53", function_arn)
+
+    original_make_api_call = BaseClient._make_api_call
+
+    def conflicting_add_permission_and_denied_get_policy(
+        self: BaseClient, operation_name: str, api_params: object
+    ) -> object:
+        if operation_name == "AddPermission":
+            raise ClientError(
+                {"Error": {"Code": "ResourceConflictException", "Message": "already exists"}},
+                operation_name,
+            )
+        if operation_name == "GetPolicy":
+            raise ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "not authorized"}},
+                operation_name,
+            )
+        return original_make_api_call(self, operation_name, api_params)
+
+    monkeypatch.setattr(
+        BaseClient, "_make_api_call", conflicting_add_permission_and_denied_get_policy
+    )
+
+    with pytest.raises(deploy.PermissionVerificationError) as exc_info:
+        deploy._ensure_schedule(session, "rate(1 hour)", "spf53", function_arn)
+    assert "lambda:GetPolicy" in str(exc_info.value)
 
 
 @mock_aws

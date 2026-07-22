@@ -152,12 +152,14 @@ spf53 will refuse to publish (and sends an SNS alert instead) when:
 - **Resolution fails outright** (NXDOMAIN, timeout, missing SPF record, a
   nesting depth over 10 `include:`s deep) for a domain. That domain is
   skipped and alerted on; other domains in the same config still run.
-- **The total SPF lookup cost exceeds the RFC 7208 hard limit of 10** —
-  chain length, plus 1 for the apex `include:`, plus any DNS-querying
-  passthrough mechanisms (`exists:`, `include:`, `a`, `mx`, `ptr`), including
-  their own transitive lookups. Exceeding 10 means real mail receivers would
-  PermError the whole domain, so spf53 refuses to publish rather than push a
-  record they can't evaluate.
+- **The total SPF lookup cost exceeds the RFC 7208 hard limit of 10** — the
+  number of `_spf53-N` chunks (that count alone already covers the whole
+  include chain, from the apex's `include:` through every chunk-to-chunk
+  `include:` link), plus any DNS-querying passthrough mechanisms
+  (`exists:`, `include:`, `a`, `mx`, `ptr`), including their own transitive
+  lookups. Exceeding 10 means real mail receivers would PermError the whole
+  domain, so spf53 refuses to publish rather than push a record they can't
+  evaluate.
 
 `spf53 apply --force` overrides a guard refusal for that run. Guard
 refusals and resolution errors always trigger an SNS notification when a
@@ -175,6 +177,12 @@ lookup away from the RFC 7208 limit above.
 | `spf53 apply` | `[-c FILE \| --ssm-param NAME] [--force]` | Applies the flattened records. Exit `0` on success (including no-op), `1` on error or guard refusal. |
 | `spf53 deploy` | `-c FILE [--schedule "rate(1 hour)"] [--create-topic NAME] [--param-name NAME] [--function-name spf53] [--region REGION] [--dry-run]` | Idempotently bootstraps the SNS topic, SSM config, IAM role, Lambda function, and EventBridge schedule. `--dry-run` prints the planned actions without making any AWS calls. |
 
+If `--param-name` isn't given to `spf53 deploy`, its default is derived
+from `--function-name`: the default function name (`spf53`) resolves to
+`/spf53/config` as before, and any other `--function-name` resolves to
+`/spf53/<function-name>/config` — so multiple deployments with distinct
+function names don't collide on the same SSM parameter.
+
 If neither `-c/--config` nor `--ssm-param` is given, `plan` and `apply`
 read from SSM parameter `/spf53/config`.
 
@@ -188,8 +196,8 @@ create/update the pieces spf53 manages:
 `iam:PutRolePolicy`, `iam:PassRole` (for the `spf53-lambda` role),
 `lambda:GetFunction`, `lambda:CreateFunction`, `lambda:UpdateFunctionCode`,
 `lambda:UpdateFunctionConfiguration`, `lambda:AddPermission`,
-`events:PutRule`, `events:PutTargets`, `ssm:PutParameter`,
-`sns:CreateTopic` (only if using `--create-topic`), and
+`lambda:GetPolicy`, `events:PutRule`, `events:PutTargets`,
+`ssm:PutParameter`, `sns:CreateTopic` (only if using `--create-topic`), and
 `sts:GetCallerIdentity`.
 
 **The Lambda's own execution role** (`spf53-lambda`, created by `deploy`) is
@@ -215,10 +223,11 @@ verbatim.
 **Why isn't boto3 bundled in the Lambda deployment package?**
 The Lambda Python runtime already ships boto3, so bundling it again would
 just bloat the deployment zip for no benefit. `spf53 deploy` only packages
-`dnspython`, `pyyaml`, and the spf53 package itself, pinned to the pure-Python
-wheel versions installed in the environment you're deploying from — so the
-zip matches what you tested, regardless of the Lambda runtime's own Python
-version.
+`dnspython`, `pyyaml`, and the spf53 package itself, pinned to the versions
+installed in the environment you're deploying from and built specifically
+for the Lambda runtime's own platform and Python version — so the zip
+matches what you tested and runs correctly regardless of what platform or
+Python version `spf53 deploy` itself runs under.
 
 **How do I add or remove a provider?**
 Edit the `includes` (or `passthrough`) list in your config and re-apply —
