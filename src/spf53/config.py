@@ -53,6 +53,19 @@ _MACRO_D_RE = re.compile(r"%\{[dD][^}]*\}")
 # trailing 'r'; delimiter is one of . - + , / _ =, and may repeat.
 _MACRO_EXPAND_RE = re.compile(r"%(?:%|_|-|\{(?i:[slodiphcrtv])[0-9]*[rR]?[.\-+,/_=]*\})")
 
+# RFC 7208 §5's DNS label limits -- the ABNF itself doesn't encode these
+# (it defers to DNS's own rules), but a label/name past these bounds can
+# never resolve, which is the same "publishes but authorizes nothing"
+# failure mode as a grammar violation.
+_MAX_LABEL_LEN = 63
+_MAX_DOMAIN_LEN = 253
+
+# Stand-in for a macro-expand when checking a passthrough target's domain
+# structure (see _validate_domain_spec) -- never a real character, since
+# the visible-ASCII gate in _validate_passthrough_shape already restricts
+# every character reaching that function to 0x21-0x7E.
+_MACRO_PLACEHOLDER = "\x00"
+
 
 class ConfigError(Exception):
     """Raised when a config fails validation."""
@@ -133,6 +146,112 @@ def _check_duplicate_domains(domains: Sequence[DomainConfig]) -> None:
                 "both configure the same domain"
             )
         seen[d.name] = i
+
+
+def _validate_domain_spec(target: str, label: str, entry: str) -> None:
+    """Validate `target` -- the portion after a:/mx:/ptr:/exists:/include:/
+    redirect=, with any CIDR-length suffix already stripped by the caller --
+    as an RFC 7208 §7.1 domain-spec: `macro-string domain-end`, where
+    `domain-end = ( "." toplabel [ "." ] ) / macro-expand`.
+
+    A target that's entirely macro-expand(s), e.g. "%{ir}", legitimately
+    stands in for the whole domain-end and needs no further check --
+    `macro_free` (every macro-expand deleted) being empty is exactly that
+    case. Otherwise, every macro-expand in `target` is replaced with a
+    single placeholder character (`_MACRO_PLACEHOLDER`) rather than
+    deleted, and the checks below run against that. Deleting outright
+    would make a macro that legitimately stands for a whole label -- or
+    sits right next to a literal dot -- look like an empty label after
+    the fact: "foo.%{i}.example.com" would misread as
+    "foo..example.com", and a leading macro would misread as a leading
+    empty label the same way ".a" genuinely is. The placeholder can't
+    collide with real content: the visible-ASCII gate earlier in
+    `_validate_passthrough_shape` already restricts every character that
+    reaches this function to 0x21-0x7E.
+
+    What's left is checked in two tiers:
+
+    Tier 1 (RFC-invalid, always rejected): the remainder must have a dot
+    before its final label, and that final label must be a real toplabel
+    -- non-empty, containing a letter, not starting or ending with a
+    hyphen, and not all-digits. A remainder that's just "." or ends in
+    ".." has no such label at all. This is the actual bug: entries like
+    "exists:spfhosts" (no dot), "exists:example.123" (all-numeric
+    toplabel), and "exists:example.com-" (hyphen-ending toplabel)
+    currently sail through and publish a record that PermErrors the whole
+    domain at real receivers.
+
+    Tier 2 (RFC-grammar-valid but never resolves, also rejected): an empty
+    label anywhere but the final position (already covered by Tier 1), a
+    literal label over 63 octets, or a literal (non-macro) portion over
+    253 octets. RFC 7208's ABNF doesn't encode DNS's own length limits, so
+    these pass a strict grammar reading, but a name like this can never
+    resolve -- the same "publishes but silently authorizes nothing"
+    failure mode as the %{d} relocation bug from an earlier round.
+    """
+    macro_free = _MACRO_EXPAND_RE.sub("", target)
+    if not macro_free:
+        return
+
+    literal = _MACRO_EXPAND_RE.sub(_MACRO_PLACEHOLDER, target)
+
+    if literal == "." or literal.endswith(".."):
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} has a malformed domain target "
+            f"{target!r} — RFC 7208's domain-end grammar requires a real toplabel, "
+            "not an empty one"
+        )
+
+    # A single trailing dot is the FQDN form and is legal per domain-end's
+    # optional "[ '.' ]" -- strip it before pulling out the final label.
+    trimmed = literal[:-1] if literal.endswith(".") else literal
+
+    if "." not in trimmed:
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} has target {target!r} with no "
+            "dot at all — RFC 7208's domain-end grammar requires a literal '.' "
+            "before the final label, unless the entire target is a macro-expand"
+        )
+
+    labels = trimmed.split(".")
+    final_label = labels[-1]
+    if (
+        final_label[0] == "-"
+        or final_label[-1] == "-"
+        or not any(ch.isalpha() for ch in final_label)
+    ):
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} has target {target!r} whose "
+            f"final label {final_label!r} isn't a valid RFC 7208 toplabel — it "
+            "must contain a letter and must not start or end with a hyphen or be "
+            "all-digits"
+        )
+
+    # Tier 2: grammar-valid but can never resolve to anything. Every
+    # non-final label (the final one was already validated above) must be
+    # non-empty -- a placeholder-only label is never empty, so a macro
+    # sitting at any position, including the very first label, correctly
+    # doesn't trip this.
+    if any(not lbl for lbl in labels[:-1]):
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} has target {target!r} with an "
+            "empty label — this is syntactically legal SPF grammar but can never "
+            "resolve to anything, so it would silently authorize nothing"
+        )
+    if any(_MACRO_PLACEHOLDER not in lbl and len(lbl) > _MAX_LABEL_LEN for lbl in labels):
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} has target {target!r} with a "
+            f"label over {_MAX_LABEL_LEN} octets — this is syntactically legal "
+            "SPF grammar but can never resolve to anything, so it would silently "
+            "authorize nothing"
+        )
+    if len(macro_free) > _MAX_DOMAIN_LEN:
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} has target {target!r} whose "
+            f"literal portion is over {_MAX_DOMAIN_LEN} octets — this is "
+            "syntactically legal SPF grammar but can never resolve to anything, "
+            "so it would silently authorize nothing"
+        )
 
 
 def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
@@ -236,9 +355,22 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
                 f"{label}: passthrough entry {entry!r} has an invalid IPv6 CIDR "
                 f"length '//{len6}' — must be 0-128"
             )
+        _validate_domain_spec(a_mx_match.group("host"), label, entry)
         return
 
-    if _PTR_RE.match(stripped) or _EXISTS_INCLUDE_RE.match(stripped) or _REDIRECT_RE.match(entry):
+    ptr_match = _PTR_RE.match(stripped)
+    if ptr_match is not None:
+        _validate_domain_spec(ptr_match.group("host"), label, entry)
+        return
+
+    exists_include_match = _EXISTS_INCLUDE_RE.match(stripped)
+    if exists_include_match is not None:
+        _validate_domain_spec(exists_include_match.group("target"), label, entry)
+        return
+
+    redirect_match = _REDIRECT_RE.match(entry)
+    if redirect_match is not None:
+        _validate_domain_spec(redirect_match.group("target"), label, entry)
         return
 
     raise ConfigError(

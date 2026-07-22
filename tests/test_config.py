@@ -794,6 +794,127 @@ domains:
         parse_config(yaml_text)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "exists:spfhosts",
+        "exists:.",
+        "mx:..",
+        "ptr:foo",
+        "exists:example.123",
+        "exists:example.com-",
+    ],
+)
+def test_malformed_domain_target_passthrough_raises_config_error(value: str) -> None:
+    """Round 7, verified against pyspf: the mechanism *target* (the domain
+    part after a:/mx:/ptr:/exists:/include:/redirect=) was never validated
+    as an actual RFC 7208 domain-end -- a bare single-label target with no
+    dot ("spfhosts"), an empty toplabel ("." or ".."), or a toplabel that's
+    all-digits ("example.123") or ends in a hyphen ("example.com-") all
+    published verbatim and PermErrored the whole domain at real receivers,
+    even with the sender IP inside a legitimately-authorized range.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+@pytest.mark.parametrize("prefix", ["a:", "mx:", "ptr:", "exists:", "include:"])
+def test_bare_single_label_target_rejected_for_every_mechanism(prefix: str) -> None:
+    """The domain-spec check applies uniformly to every mechanism that takes
+    a target -- not just exists:, which round 7's initial finding happened
+    to use.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{prefix}spfhosts"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_redirect_bare_single_label_target_raises_config_error() -> None:
+    """redirect= takes a domain-spec target too (RFC 7208 §6.1), so it needs
+    the same domain-syntax validation as a:/mx:/ptr:/exists:/include:.
+    """
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["redirect=spfhosts"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "exists:foo..example.com",
+        "exists:" + "a" * 80 + ".example.com",
+    ],
+)
+def test_tier2_grammar_valid_but_unresolvable_domain_target_raises_config_error(
+    value: str,
+) -> None:
+    """These are syntactically legal per a strict RFC 7208 ABNF reading (it
+    defers label-length limits to DNS itself), but can never resolve to
+    anything -- an interior empty label ('foo..example.com') or a label
+    over 63 octets never matches any real DNS name, so the authorization
+    would silently do nothing. Same failure class as an earlier round's
+    %{d} relocation bug.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_domain_target_total_length_over_253_raises_config_error() -> None:
+    long_target = ".".join(["a" * 50] * 5) + ".example.com"  # well over 253 octets
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["exists:{long_target}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_trailing_dot_fqdn_domain_target_accepted() -> None:
+    """A single trailing dot (the fully-qualified form) is legal per
+    domain-end's optional '[ "." ]' and must not be rejected as an empty
+    final label.
+    """
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "a:mail.example.com."
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == ("a:mail.example.com.",)
+
+
 def test_load_config_file(tmp_path: Path) -> None:
     config_path = tmp_path / "spf53.yaml"
     config_path.write_text(MINIMAL_YAML)

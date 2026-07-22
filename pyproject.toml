@@ -32,6 +32,8 @@ dev = [
     "pytest>=8.0",
     "moto[route53,sns,ssm,iam,awslambda,events]>=5.0",
     "ruff>=0.5",
+    "pyspf>=2.0.14",
+    "hypothesis>=6.100",
 ]
 
 [project.scripts]
