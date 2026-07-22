@@ -270,6 +270,36 @@ domains:
         parse_config(yaml_text)
 
 
+@pytest.mark.parametrize("name", ["exämple.com", "has space.com", "exa!mple.com"])
+def test_domain_name_with_invalid_characters_raises_config_error(name: str) -> None:
+    """DNS names are LDH (letters/digits/hyphen) joined by dots -- a raw
+    non-ASCII or otherwise invalid character (e.g. an un-punycoded IDN, or
+    a stray space) would publish _spf53-N.<name> chunk records under a name
+    Route53 stores octal-escaped, which get_txt_records's own name regex
+    never matches back on read -- a perpetual diff/notify loop that
+    authorizes nothing for that domain.
+    """
+    yaml_text = f"""
+domains:
+  - name: "{name}"
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    with pytest.raises(ConfigError, match="name"):
+        parse_config(yaml_text)
+
+
+def test_punycode_domain_name_accepted() -> None:
+    yaml_text = """
+domains:
+  - name: xn--exmple-cua.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].name == "xn--exmple-cua.com"
+
+
 def test_duplicate_domain_raises_config_error() -> None:
     yaml_text = """
 domains:

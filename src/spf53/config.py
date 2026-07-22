@@ -22,6 +22,10 @@ _ALLOWED_DOMAIN_KEYS = {
 }
 _VALID_POLICIES = ("~all", "-all")
 
+# LDH (letters/digits/hyphen) labels joined by dots -- the actual character
+# set DNS names use. Applied after lowercasing, so no uppercase in the class.
+_DOMAIN_NAME_RE = re.compile(r"[a-z0-9-]+(\.[a-z0-9-]+)*")
+
 # The mechanism/modifier shapes spf53 knows how to relocate verbatim into
 # `_spf53-1.<domain>`. A passthrough entry is accepted only if it matches one
 # of these -- requiring a real, non-empty target as part of the shape itself
@@ -416,6 +420,14 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
     # UPSERT of the same rrset that Route53 rejects.
     if not name or name.endswith("."):
         raise ConfigError(f"{label}: 'name' must be a non-empty string")
+    # DNS names are LDH (letters/digits/hyphen) plus dots -- a raw non-ASCII
+    # or otherwise invalid character here (e.g. an un-punycoded IDN, or a
+    # stray space) would publish _spf53-N.<name> chunk records under a name
+    # Route53 stores octal-escaped and get_txt_records's own name regex
+    # never matches back on read -- a perpetual diff/notify loop that
+    # authorizes nothing for that domain.
+    if not _DOMAIN_NAME_RE.fullmatch(name):
+        raise ConfigError(f"{label}: 'name' {name!r} is not a valid DNS name")
     label = f"domain '{name}'"
 
     if "hosted_zone_id" not in raw:
