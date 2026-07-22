@@ -47,6 +47,12 @@ _REDIRECT_RE = re.compile(r"^redirect=(?P<target>.+)$", re.IGNORECASE)
 # transformer digits/flags, closed by '}'.
 _MACRO_D_RE = re.compile(r"%\{[dD][^}]*\}")
 
+# RFC 7208 7.1's macro-expand grammar: %% / %_ / %- / %{macro-letter
+# transformers *delimiter}. macro-letter is one of s/l/o/d/i/p/h/c/r/t/v
+# (case-insensitive); transformers is optional digits with an optional
+# trailing 'r'; delimiter is one of . - + , / _ =, and may repeat.
+_MACRO_EXPAND_RE = re.compile(r"%(?:%|_|-|\{(?i:[slodiphcrtv])[0-9]*[rR]?[.\-+,/_=]*\})")
+
 
 class ConfigError(Exception):
     """Raised when a config fails validation."""
@@ -141,11 +147,12 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
     not on it is rejected by default.
     """
     # RFC 7208's macro-literal grammar is exactly the visible-ASCII range
-    # %x21-24 / %x26-7E (i.e. everything printable except backslash) --
-    # nothing outside 0x21-0x7e is ever legal in an SPF record. isascii()
-    # alone isn't enough: it admits C0 control characters (\x00-\x1f) and
-    # DEL (\x7f), which aren't excluded by the separate whitespace check
-    # either (isspace() only catches a handful of them) and can reach this
+    # %x21-24 / %x26-7E (i.e. everything printable except '%' itself, which
+    # is only legal as a macro-expand introducer) -- nothing outside
+    # 0x21-0x7e is ever legal in an SPF record. isascii() alone isn't
+    # enough: it admits C0 control characters (\x00-\x1f) and DEL (\x7f),
+    # which aren't excluded by the separate whitespace check either
+    # (isspace() only catches a handful of them) and can reach this
     # function via a YAML double-quoted escape like "a:host\x00.example".
     # Gating on the visible range closes that, plus every non-ASCII byte
     # (including Unicode digits in a CIDR length, e.g. '/2٤', which
@@ -155,6 +162,22 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
         raise ConfigError(
             f"{label}: passthrough entry {entry!r} contains a character outside "
             "RFC 7208's printable-ASCII SPF alphabet — this would publish invalid "
+            "syntax"
+        )
+
+    # The visible-ASCII gate above admits '%' -- it has to, since macros are
+    # the documented, common passthrough use case (e.g. '%{i}'). But every
+    # '%' must actually introduce one of RFC 7208's four legal macro-expand
+    # forms (%%, %_, %-, or %{<letter><transformers><delimiters>}); anything
+    # else (a bare '%', an unknown macro letter, a missing closing brace) is
+    # a syntax error that permerrors the whole domain, same blast radius as
+    # an invalid character. Removing every valid macro-expand match and
+    # checking no '%' remains catches all of those in one pass.
+    if _MACRO_EXPAND_RE.sub("", entry).count("%"):
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} contains a '%' that isn't part "
+            "of a valid SPF macro-expand sequence (%%, %_, %-, or "
+            "%{<letter><transformers><delimiters>}) — this would publish invalid "
             "syntax"
         )
 

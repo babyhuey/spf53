@@ -546,6 +546,62 @@ domains:
         parse_config(yaml_text)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "exists:%q.example.com",  # bare '%' before an invalid escape char
+        "exists:%{z}.example.com",  # invalid macro letter
+        "exists:%{i.example.com",  # unterminated macro, otherwise-valid letter
+        "include:50%.example.com",  # bare '%' inside a target
+        "a:%.example.com",
+        "exists:%{dfoo.example",  # unterminated %{d -- dodges _MACRO_D_RE's own check
+    ],
+)
+def test_invalid_macro_sequence_passthrough_raises_config_error(value: str) -> None:
+    """The visible-ASCII gate has to admit '%' since macros are a documented
+    passthrough use case, but every '%' must actually introduce one of RFC
+    7208's four legal macro-expand forms (%%, %_, %-, %{...}) -- anything
+    else is a syntax error that permerrors the whole domain, same blast
+    radius as an invalid character.
+    """
+    yaml_text = f"""
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough: ["{value}"]
+"""
+    with pytest.raises(ConfigError, match="example.com"):
+        parse_config(yaml_text)
+
+
+def test_valid_macro_sequence_passthrough_entries_accepted() -> None:
+    yaml_text = """
+domains:
+  - name: example.com
+    hosted_zone_id: Z123EXAMPLE
+    includes: [_spf.google.com]
+    passthrough:
+      - "exists:%{i}._spf.example.net"
+      - "exists:%{ir}._spf.example.net"
+      - "exists:%{s}._spf.example.net"
+      - "exists:%%25.example.net"
+      - "exists:%_.example.net"
+      - "exists:%-.example.net"
+      - "exists:%{l1r+}._spf.example.net"
+"""
+    cfg = parse_config(yaml_text)
+    assert cfg.domains[0].passthrough == (
+        "exists:%{i}._spf.example.net",
+        "exists:%{ir}._spf.example.net",
+        "exists:%{s}._spf.example.net",
+        "exists:%%25.example.net",
+        "exists:%_.example.net",
+        "exists:%-.example.net",
+        "exists:%{l1r+}._spf.example.net",
+    )
+
+
 @pytest.mark.parametrize("value", ["", "   "])
 def test_empty_or_whitespace_only_passthrough_raises_config_error(value: str) -> None:
     yaml_text = f"""
