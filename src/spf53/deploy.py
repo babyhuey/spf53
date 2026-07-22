@@ -427,6 +427,13 @@ def _ensure_lambda_function(
             MemorySize=MEMORY_MB,
             Environment=env,
         )
+        # Like update_function_code above, this is itself async -- without
+        # waiting here too, _ensure_schedule's add_permission call can land
+        # while the function is still "Updating" and get a
+        # ResourceConflictException for THAT reason, which the caller
+        # currently (mis)treats as "permission already present" and silently
+        # never grants it.
+        _wait_for_update(lam, function_name)
         print(f"updated Lambda function {function_name}")
     else:
         response = _create_function(lam, function_name, role_arn, zip_bytes, env)

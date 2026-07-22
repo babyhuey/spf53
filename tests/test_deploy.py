@@ -407,7 +407,11 @@ def test_update_path_waits_between_code_and_config_updates(
 
     assert deploy.run_deploy(args) == 0
 
-    assert calls == ["UpdateFunctionCode", "wait", "UpdateFunctionConfiguration"]
+    # A wait after UpdateFunctionConfiguration too, not just before it --
+    # without it, _ensure_schedule's add_permission call can land while the
+    # function is still "Updating" and get misclassified as "permission
+    # already present" instead of a real conflict.
+    assert calls == ["UpdateFunctionCode", "wait", "UpdateFunctionConfiguration", "wait"]
 
 
 @mock_aws
