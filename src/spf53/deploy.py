@@ -116,6 +116,15 @@ def run_deploy(args: argparse.Namespace) -> int:
         if new_topic_arn:
             yaml_text = _inject_topic_arn(yaml_text, new_topic_arn)
             topic_arn = new_topic_arn
+            # The injected ARN only lives in the config pushed to SSM this
+            # run -- the user's local config file on disk is never touched.
+            # Without this, the next `spf53 deploy` run without
+            # --create-topic pushes a config with no sns_topic_arn, silently
+            # dropping SNS alerting from the deployed Lambda's IAM policy.
+            print(
+                f"add `sns_topic_arn: {new_topic_arn}` to {args.config} so future "
+                "deploys without --create-topic don't drop SNS alerting"
+            )
         else:
             topic_arn = cfg.sns_topic_arn
 
@@ -212,7 +221,14 @@ def _inline_policy(
     # "myconfig" glues onto "parameter" with no separator, matching no real
     # resource.
     param_arn = f"arn:aws:ssm:{region}:{account_id}:parameter/{param_name.lstrip('/')}"
-    log_group_arn = f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{function_name}:*"
+    # logs:CreateLogGroup is evaluated against the log group's own ARN with
+    # no trailing colon or stream wildcard, while CreateLogStream/PutLogEvents
+    # need the ":*" stream-wildcard suffix. IAM resource matching requires
+    # the pattern's literal characters (including that trailing colon) to
+    # actually be present in the evaluated resource string, so a policy
+    # scoped only to the ":*"-suffixed ARN never grants CreateLogGroup.
+    log_group_arn = f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{function_name}"
+    log_stream_arn = f"{log_group_arn}:*"
 
     statements: list[dict[str, Any]] = [
         {
@@ -228,10 +244,16 @@ def _inline_policy(
             "Resource": param_arn,
         },
         {
-            "Sid": "CloudWatchLogs",
+            "Sid": "CloudWatchLogsCreateGroup",
             "Effect": "Allow",
-            "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+            "Action": "logs:CreateLogGroup",
             "Resource": log_group_arn,
+        },
+        {
+            "Sid": "CloudWatchLogsStream",
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": log_stream_arn,
         },
     ]
     if topic_arn:
@@ -356,8 +378,23 @@ def build_lambda_zip() -> bytes:
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in sorted(Path(build_dir).rglob("*")):
-                if path.is_file():
-                    zf.write(path, path.relative_to(build_dir))
+                if not path.is_file():
+                    continue
+                # zf.write() copies the source file's on-disk Unix mode into
+                # the zip entry's external_attr. Files staged by `pip install
+                # --target` and shutil.copy2 inherit whatever mode the deploy
+                # machine's umask/source files happen to have -- under a
+                # restrictive umask (e.g. 077, common on hardened
+                # workstations) that can produce a zip Lambda's execution
+                # environment can't read, failing every invocation with
+                # Runtime.ImportModuleError. Build the ZipInfo explicitly and
+                # normalize to 0o644 (nothing here needs to be executable) so
+                # the zip's permissions never depend on the deploy machine.
+                zip_info = zipfile.ZipInfo.from_file(path, path.relative_to(build_dir))
+                zip_info.compress_type = zipfile.ZIP_DEFLATED
+                zip_info.external_attr = 0o644 << 16
+                zip_info.create_system = 3  # Unix, so external_attr's mode bits are honored
+                zf.writestr(zip_info, path.read_bytes())
         return buffer.getvalue()
 
 

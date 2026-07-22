@@ -102,6 +102,12 @@ function, EventBridge schedule — all created or updated idempotently):
 spf53 deploy -c spf53.yaml --create-topic spf53-alerts
 ```
 
+`--create-topic` injects the new topic's ARN into the config pushed to SSM,
+but not into your local `spf53.yaml`. Add the printed `sns_topic_arn` to
+your local config file, or a future `spf53 deploy` run without
+`--create-topic` will push a config with no `sns_topic_arn` and silently
+drop SNS alerting.
+
 From then on, spf53 runs itself every hour. To trigger a one-off run
 against the config already deployed to SSM:
 

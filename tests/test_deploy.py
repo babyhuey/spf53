@@ -108,9 +108,14 @@ def test_policy_scoped_to_config_arns(tmp_path: Path) -> None:
     assert resources["SsmConfig"] == f"arn:aws:ssm:us-east-1:{account_id}:parameter/spf53/config"
     assert resources["SnsAlerts"] == topic_arn
     assert (
-        resources["CloudWatchLogs"]
+        resources["CloudWatchLogsCreateGroup"]
+        == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53"
+    )
+    assert (
+        resources["CloudWatchLogsStream"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53:*"
     )
+    assert resources["CloudWatchLogsCreateGroup"] != resources["CloudWatchLogsStream"]
 
 
 @mock_aws
@@ -162,12 +167,12 @@ def test_distinct_function_names_get_independent_iam_role_policies(tmp_path: Pat
 
     assert resources_a["Route53Flatten"] == ["arn:aws:route53:::hostedzone/Z123EXAMPLE"]
     assert (
-        resources_a["CloudWatchLogs"]
+        resources_a["CloudWatchLogsStream"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53-a:*"
     )
     assert resources_b["Route53Flatten"] == ["arn:aws:route53:::hostedzone/Z456OTHER"]
     assert (
-        resources_b["CloudWatchLogs"]
+        resources_b["CloudWatchLogsStream"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53-b:*"
     )
     assert len(iam.list_roles()["Roles"]) == 2
@@ -215,6 +220,26 @@ def test_create_topic_injects_arn_into_pushed_config(tmp_path: Path) -> None:
     topic_arn = boto3.client("sns", region_name="us-east-1").list_topics()["Topics"][0]["TopicArn"]
 
     assert pushed_data["sns_topic_arn"] == topic_arn
+
+
+@mock_aws
+def test_create_topic_prints_local_config_reminder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--create-topic injects the new ARN into the config pushed to SSM but
+    never touches the user's local config file on disk. Without an explicit
+    nudge, the natural next step -- editing something else locally and
+    re-running `spf53 deploy` without --create-topic -- pushes a config with
+    no sns_topic_arn, silently dropping SNS alerting."""
+    config_path = _write_config(tmp_path)
+    args = _make_args(config_path, create_topic="spf53-alerts")
+
+    assert deploy.run_deploy(args) == 0
+
+    topic_arn = boto3.client("sns", region_name="us-east-1").list_topics()["Topics"][0]["TopicArn"]
+    out = capsys.readouterr().out
+    assert f"sns_topic_arn: {topic_arn}" in out
+    assert str(config_path) in out
 
 
 @mock_aws
@@ -590,3 +615,42 @@ def test_build_lambda_zip_locates_package_via_spf53_dunder_file(
         assert zf.read("spf53/__init__.py").decode() == "__version__ = 'fake-0.0.0'\n"
         assert zf.read("spf53/lambda_handler.py").decode() == "FAKE_MARKER = True\n"
         assert "spf53/config.py" not in zf.namelist()
+
+
+def test_build_lambda_zip_normalizes_file_permissions_to_0o644(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AWS Lambda requires deployment package files to be world-readable.
+    zf.write() (the old implementation) copies each source file's on-disk
+    Unix mode into the zip entry's external_attr -- so a zip built on a
+    machine with a restrictive umask (e.g. 077, common on hardened
+    workstations) would deploy successfully but crash on every invocation
+    with Runtime.ImportModuleError, since the files aren't readable by the
+    Lambda execution environment. Proven here by chmod'ing a source file to
+    0o600 before building: every entry in the resulting zip -- including
+    that one -- must still come out as 0o644, proving normalization
+    actually happens rather than just coincidentally matching."""
+    import io
+    import stat
+    import zipfile
+
+    import spf53
+
+    fake_pkg_dir = tmp_path / "fake_site_packages" / "spf53"
+    fake_pkg_dir.mkdir(parents=True)
+    init_file = fake_pkg_dir / "__init__.py"
+    init_file.write_text("__version__ = 'fake-0.0.0'\n")
+    restricted_file = fake_pkg_dir / "lambda_handler.py"
+    restricted_file.write_text("FAKE_MARKER = True\n")
+    restricted_file.chmod(0o600)
+
+    monkeypatch.setattr(deploy, "build_lambda_zip", _REAL_BUILD_LAMBDA_ZIP)
+    monkeypatch.setattr(spf53, "__file__", str(init_file))
+
+    zip_bytes = deploy.build_lambda_zip()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        assert zf.infolist(), "zip should not be empty"
+        for info in zf.infolist():
+            mode = stat.S_IMODE(info.external_attr >> 16)
+            assert mode == 0o644, f"{info.filename} has mode {oct(mode)}, expected 0o644"
