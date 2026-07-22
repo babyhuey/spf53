@@ -6,7 +6,7 @@ import ipaddress
 
 import pytest
 
-from spf53 import chunker, lambda_handler, notify, resolver, route53, ssm
+from spf53 import chunker, core, lambda_handler, notify, resolver, route53, ssm
 from spf53.config import DomainConfig, Spf53Config
 
 NET_A = ipaddress.ip_network("192.0.2.0/24")
@@ -65,3 +65,47 @@ def test_lambda_handler_guard_refusal_sends_sns_notification(
     assert "example.com" in subject
     assert "example.com" in message
     assert "safety guard failed" in message.lower()
+
+
+def test_lambda_handler_raises_on_domain_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A domain-level error must surface as a raised exception, not just a
+    quiet entry in the return value -- EventBridge discards the return
+    value on a scheduled (async) invocation, so raising is the ONLY
+    mechanism that turns a failed run into a visible Lambda error
+    (CloudWatch Errors metric, EventBridge retry). A regression here would
+    make failed scheduled runs silently look successful.
+    """
+    cfg = _cfg([_domain()])
+    monkeypatch.setattr(ssm, "load_config_ssm", lambda param_name: cfg)
+    monkeypatch.setattr(
+        core,
+        "apply",
+        lambda cfg, force=False: core.RunResult(
+            plans=(), errors=("example.com: resolution failed",)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="example.com: resolution failed"):
+        lambda_handler.lambda_handler({}, None)
+
+
+def test_lambda_handler_uses_spf53_param_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every non-default --function-name deployment sets SPF53_PARAM in the
+    Lambda's environment so it reads its own SSM parameter instead of the
+    default -- this confirms the handler actually honors that override
+    rather than always reading ssm.DEFAULT_PARAM.
+    """
+    cfg = _cfg([_domain()])
+    seen_param_names: list[str] = []
+
+    def fake_load(param_name: str) -> Spf53Config:
+        seen_param_names.append(param_name)
+        return cfg
+
+    monkeypatch.setattr(ssm, "load_config_ssm", fake_load)
+    monkeypatch.setattr(core, "apply", lambda cfg, force=False: core.RunResult(plans=(), errors=()))
+    monkeypatch.setenv("SPF53_PARAM", "/spf53/spf53-a/config")
+
+    lambda_handler.lambda_handler({}, None)
+
+    assert seen_param_names == ["/spf53/spf53-a/config"]
