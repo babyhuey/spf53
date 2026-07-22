@@ -176,7 +176,6 @@ _KNOWN_GOOD_SEEDS = [
     "ptr:example.com",
     "exists:%{i}._spf.example.net",
     "include:_spf.example.net",
-    "redirect=vendor.example",
     "a:mail.example.com/32",
     "exists:%{ir}._spf.example.net",
 ]
@@ -193,6 +192,7 @@ _KNOWN_BAD_SEEDS = [
     "+",
     "all",
     "ip4=1.2.3.0/24",
+    "redirect=vendor.example",
 ]
 
 _passthrough_entries = st.one_of(
@@ -234,8 +234,6 @@ _HISTORICAL_ACCEPTED_ENTRIES = [
     "exists:%{l1r+}._spf.example.net",
     "ip4:203.0.113.0/24",
     "include:_spf.example.net",
-    "redirect=_spf.example.net",
-    "redirect=vendor.example",
     "ip6:2001:db8::/32",
     "a:mail.example.com.",
 ]

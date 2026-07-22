@@ -711,7 +711,6 @@ domains:
         "ptr:example.com",
         "exists:%{i}._spf.example.net",
         "include:_spf.example.net",
-        "redirect=_spf.example.net",
     ],
 )
 def test_well_formed_target_passthrough_entries_accepted(value: str) -> None:
@@ -848,16 +847,22 @@ domains:
         parse_config(yaml_text)
 
 
-def test_redirect_bare_single_label_target_raises_config_error() -> None:
-    """redirect= takes a domain-spec target too (RFC 7208 §6.1), so it needs
-    the same domain-syntax validation as a:/mx:/ptr:/exists:/include:.
+@pytest.mark.parametrize("target", ["vendor.example", "spfhosts"])
+def test_redirect_passthrough_always_raises_config_error(target: str) -> None:
+    """redirect= is rejected in passthrough regardless of whether its target
+    is otherwise well-formed -- RFC 7208 6.1 requires redirect= to be
+    ignored whenever the record has an 'all' mechanism, and chunk 1 gets
+    the terminal policy appended whenever the flattened output fits in a
+    single chunk, so a passthrough redirect= would silently do nothing
+    until IP counts happen to grow enough to spill into a second chunk,
+    then start being honored -- toggling live/dead with ordinary IP drift.
     """
-    yaml_text = """
+    yaml_text = f"""
 domains:
   - name: example.com
     hosted_zone_id: Z123EXAMPLE
     includes: [_spf.google.com]
-    passthrough: ["redirect=spfhosts"]
+    passthrough: ["redirect={target}"]
 """
     with pytest.raises(ConfigError, match="example.com"):
         parse_config(yaml_text)

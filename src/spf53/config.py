@@ -35,11 +35,12 @@ _A_MX_RE = re.compile(
 )
 _PTR_RE = re.compile(r"^ptr:(?P<host>[^/]+)$", re.IGNORECASE)
 _EXISTS_INCLUDE_RE = re.compile(r"^(?:exists|include):(?P<target>.+)$", re.IGNORECASE)
-# redirect= is a modifier, not a mechanism -- RFC 7208 gives it no qualifier
-# prefix -- so this is matched against the raw entry rather than the
-# qualifier-stripped one. A leading qualifier char (e.g. "+redirect=x.com")
-# is itself invalid syntax and correctly falls through to the generic
-# rejection instead of being treated as a valid redirect=.
+# redirect= is deliberately NOT one of the accepted passthrough shapes (see
+# the dedicated rejection below) -- this regex exists only to recognize the
+# shape so that rejection can explain why, rather than falling through to
+# the generic "not a recognized form" message. redirect= is a modifier, not
+# a mechanism -- RFC 7208 gives it no qualifier prefix -- so this is matched
+# against the raw entry rather than the qualifier-stripped one.
 _REDIRECT_RE = re.compile(r"^redirect=(?P<target>.+)$", re.IGNORECASE)
 
 # Matches any %{d...} macro reference (%{d}, %{d1}, %{d2r}, %{D}, ...) --
@@ -368,15 +369,23 @@ def _validate_passthrough_shape(entry: str, label: str, name: str) -> None:
         _validate_domain_spec(exists_include_match.group("target"), label, entry)
         return
 
-    redirect_match = _REDIRECT_RE.match(entry)
-    if redirect_match is not None:
-        _validate_domain_spec(redirect_match.group("target"), label, entry)
-        return
+    if _REDIRECT_RE.match(entry) is not None:
+        raise ConfigError(
+            f"{label}: passthrough entry {entry!r} uses redirect=, which spf53 "
+            "does not support in passthrough — RFC 7208 requires redirect= to be "
+            "ignored whenever the record also has an 'all' mechanism, and chunk 1 "
+            "gets the terminal policy appended whenever the flattened output fits "
+            "in a single chunk, so a passthrough redirect= would silently do "
+            "nothing until IP counts happen to grow enough to spill into a second "
+            "chunk — then start being honored, toggling live/dead with ordinary IP "
+            "drift. Use include: instead, which has the same pass-propagation "
+            "semantics and works regardless of chunk count"
+        )
 
     raise ConfigError(
         f"{label}: passthrough entry {entry!r} is not a recognized SPF mechanism or "
-        "modifier form — spf53 only accepts ip4:/ip6:/a:/mx:/ptr:/exists:/include:/"
-        "redirect= with an explicit, non-empty target"
+        "modifier form — spf53 only accepts ip4:/ip6:/a:/mx:/ptr:/exists:/include: "
+        "with an explicit, non-empty target"
     )
 
 
