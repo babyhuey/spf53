@@ -242,15 +242,21 @@ domains:
     assert cfg.domains[0].name == "example.com"
 
 
-def test_domain_name_only_strips_a_single_trailing_dot() -> None:
+def test_domain_name_with_double_trailing_dot_raises_config_error() -> None:
+    """Only a single trailing dot is a legitimate FQDN root marker -- a
+    second one means the input was already malformed. Silently normalizing
+    "example.com.." to "example.com." (one dot left over) would never match
+    Route53's dot-stripped names, causing a perpetual DELETE+UPSERT of the
+    same rrset that Route53 rejects.
+    """
     yaml_text = """
 domains:
   - name: example.com..
     hosted_zone_id: Z123EXAMPLE
     includes: [_spf.google.com]
 """
-    cfg = parse_config(yaml_text)
-    assert cfg.domains[0].name == "example.com."
+    with pytest.raises(ConfigError, match="name"):
+        parse_config(yaml_text)
 
 
 def test_domain_name_all_dots_raises_config_error() -> None:

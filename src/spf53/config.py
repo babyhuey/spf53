@@ -400,7 +400,12 @@ def _parse_domain(index: int, raw: object) -> DomainConfig:
     name = name.lower()
     if name.endswith("."):
         name = name[:-1]
-    if not name:
+    # A legitimate FQDN has at most one trailing dot -- if one remains after
+    # stripping a single dot (e.g. "example.com.."), the input was malformed
+    # to begin with. Left alone, this would normalize to "example.com." and
+    # never match Route53's dot-stripped names, causing a perpetual DELETE+
+    # UPSERT of the same rrset that Route53 rejects.
+    if not name or name.endswith("."):
         raise ConfigError(f"{label}: 'name' must be a non-empty string")
     label = f"domain '{name}'"
 
