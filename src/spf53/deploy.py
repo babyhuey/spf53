@@ -284,14 +284,20 @@ def _inline_policy(
     # "myconfig" glues onto "parameter" with no separator, matching no real
     # resource.
     param_arn = f"arn:aws:ssm:{region}:{account_id}:parameter/{param_name.lstrip('/')}"
-    # logs:CreateLogGroup is evaluated against the log group's own ARN with
-    # no trailing colon or stream wildcard, while CreateLogStream/PutLogEvents
-    # need the ":*" stream-wildcard suffix. IAM resource matching requires
-    # the pattern's literal characters (including that trailing colon) to
-    # actually be present in the evaluated resource string, so a policy
-    # scoped only to the ":*"-suffixed ARN never grants CreateLogGroup.
-    log_group_arn = f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{function_name}"
-    log_stream_arn = f"{log_group_arn}:*"
+    # AWS documentation (and the AWSLambdaBasicExecutionRole managed policy)
+    # suggest logs:CreateLogGroup is evaluated against the log group's own
+    # ARN with no trailing suffix, separate from CreateLogStream/PutLogEvents
+    # needing the ":*" stream-wildcard suffix -- that split was tried first
+    # and failed in production: CloudTrail showed the actual Lambda runtime
+    # requesting CreateLogGroup against a THIRD form,
+    # ".../log-group:/aws/lambda/<fn>:log-stream:" (no wildcard, literal
+    # trailing "log-stream:"), which neither the bare ARN nor a stream-only
+    # split covers. All three log actions granted on the single ":*"-suffixed
+    # resource is simpler and covers every suffix variant, since "*" matches
+    # any continuation including this one -- confirmed against a real
+    # deployment (manual invoke created its log group and wrote logs
+    # successfully after switching to this form).
+    log_group_arn = f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{function_name}:*"
 
     statements: list[dict[str, Any]] = [
         {
@@ -307,16 +313,10 @@ def _inline_policy(
             "Resource": param_arn,
         },
         {
-            "Sid": "CloudWatchLogsCreateGroup",
+            "Sid": "CloudWatchLogs",
             "Effect": "Allow",
-            "Action": "logs:CreateLogGroup",
+            "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
             "Resource": log_group_arn,
-        },
-        {
-            "Sid": "CloudWatchLogsStream",
-            "Effect": "Allow",
-            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-            "Resource": log_stream_arn,
         },
     ]
     if topic_arn:

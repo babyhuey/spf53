@@ -100,6 +100,7 @@ def test_policy_scoped_to_config_arns(tmp_path: Path) -> None:
         RoleName=deploy._role_name("spf53"), PolicyName=deploy._policy_name("spf53")
     )["PolicyDocument"]
     resources = {stmt["Sid"]: stmt["Resource"] for stmt in doc["Statement"]}
+    actions = {stmt["Sid"]: stmt["Action"] for stmt in doc["Statement"]}
 
     account_id = boto3.client("sts", region_name="us-east-1").get_caller_identity()["Account"]
     topic_arn = boto3.client("sns", region_name="us-east-1").list_topics()["Topics"][0]["TopicArn"]
@@ -108,14 +109,20 @@ def test_policy_scoped_to_config_arns(tmp_path: Path) -> None:
     assert resources["SsmConfig"] == f"arn:aws:ssm:us-east-1:{account_id}:parameter/spf53/config"
     assert resources["SnsAlerts"] == topic_arn
     assert (
-        resources["CloudWatchLogsCreateGroup"]
-        == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53"
-    )
-    assert (
-        resources["CloudWatchLogsStream"]
+        resources["CloudWatchLogs"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53:*"
     )
-    assert resources["CloudWatchLogsCreateGroup"] != resources["CloudWatchLogsStream"]
+    # All three log actions on the single ":*"-suffixed resource -- a real
+    # deployment showed the Lambda runtime requests CreateLogGroup against a
+    # THIRD ARN suffix form (".../log-group:/aws/lambda/<fn>:log-stream:")
+    # that neither a bare-ARN split nor a stream-only ":*" resource covers,
+    # so all three actions are granted together on the one resource whose
+    # wildcard matches every suffix variant.
+    assert set(actions["CloudWatchLogs"]) == {
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+    }
 
 
 @mock_aws
@@ -217,12 +224,12 @@ def test_distinct_function_names_get_independent_iam_role_policies(tmp_path: Pat
 
     assert resources_a["Route53Flatten"] == ["arn:aws:route53:::hostedzone/Z123EXAMPLE"]
     assert (
-        resources_a["CloudWatchLogsStream"]
+        resources_a["CloudWatchLogs"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53-a:*"
     )
     assert resources_b["Route53Flatten"] == ["arn:aws:route53:::hostedzone/Z456OTHER"]
     assert (
-        resources_b["CloudWatchLogsStream"]
+        resources_b["CloudWatchLogs"]
         == f"arn:aws:logs:us-east-1:{account_id}:log-group:/aws/lambda/spf53-b:*"
     )
     assert len(iam.list_roles()["Roles"]) == 2
