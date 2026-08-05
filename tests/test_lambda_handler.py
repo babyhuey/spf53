@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 
 import pytest
 
@@ -87,6 +88,50 @@ def test_lambda_handler_raises_on_domain_errors(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(RuntimeError, match="example.com: resolution failed"):
         lambda_handler.lambda_handler({}, None)
+
+
+def test_lambda_handler_logs_run_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A scheduled invocation discards the return value, so the summary is only
+    observable in CloudWatch if the handler logs it -- without this the log
+    group records nothing but START/END/REPORT and a run leaves no trace of
+    which domains it touched.
+    """
+    cfg = _cfg([_domain()])
+    monkeypatch.setattr(ssm, "load_config_ssm", lambda param_name: cfg)
+    monkeypatch.setattr(core, "apply", lambda cfg, force=False: core.RunResult(plans=(), errors=()))
+
+    with caplog.at_level(logging.INFO, logger="spf53.lambda_handler"):
+        lambda_handler.lambda_handler({}, None)
+
+    assert "changed=none" in caplog.text
+    assert "refused=none" in caplog.text
+
+
+def test_lambda_handler_logs_refusal_at_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A guard refusal is the signal the safety mechanism exists to raise. It
+    must reach CloudWatch at WARNING so it stays visible even if the package
+    log level is later raised above INFO.
+    """
+    dc = _domain()
+    desired = chunker.build_records(dc.name, [NET_A], dc.passthrough, dc.policy)
+    live = dict(desired)
+    live["_spf53-2.example.com"] = ["v=spf1 ip4:10.0.0.0/8 ~all"]
+
+    cfg = _cfg([dc])
+    monkeypatch.setattr(ssm, "load_config_ssm", lambda param_name: cfg)
+    monkeypatch.setattr(resolver, "flatten", lambda includes, ips: [NET_A])
+    monkeypatch.setattr(route53, "get_txt_records", lambda zone_id, domain: (live, {}))
+    monkeypatch.setattr(route53, "apply_changes", lambda *a, **kw: None)
+
+    with caplog.at_level(logging.WARNING, logger="spf53.lambda_handler"):
+        lambda_handler.lambda_handler({}, None)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("example.com" in r.getMessage() for r in warnings)
 
 
 def test_lambda_handler_uses_spf53_param_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
