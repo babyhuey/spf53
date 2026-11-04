@@ -1,0 +1,42 @@
+name: Dependabot auto-merge
+
+# Squash-merges a Dependabot PR once its CI run succeeds. CI gating lives here
+# (workflow_run) instead of `gh pr merge --auto`, because without branch
+# protection --auto merges immediately. Major bumps are left for manual review.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.actor.login == 'dependabot[bot]'
+    steps:
+      - name: Merge if not a major bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list -R "$REPO" --head "$HEAD_BRANCH" --author app/dependabot --state open \
+            --json number,headRefOid --jq ".[] | select(.headRefOid == \"$HEAD_SHA\") | .number")
+          if [ -z "$pr" ]; then
+            echo "No open Dependabot PR at $HEAD_SHA"
+            exit 0
+          fi
+          if gh api "repos/$REPO/commits/$HEAD_SHA" --jq .commit.message \
+            | grep -q 'update-type: version-update:semver-major'; then
+            echo "#$pr includes a major bump; leaving for manual review"
+            exit 0
+          fi
+          gh pr merge "$pr" -R "$REPO" --squash --delete-branch --match-head-commit "$HEAD_SHA"
